@@ -192,6 +192,12 @@ type BlueGreenStrategy struct {
 	// ActiveMetadata specify labels and annotations which will be attached to the active pods for
 	// the duration which they act as a active pod, and will be removed after
 	ActiveMetadata *PodTemplateMetadata `json:"activeMetadata,omitempty" protobuf:"bytes,13,opt,name=activeMetadata"`
+	// Mirror enables traffic mirroring
+	// +optional
+	Mirror *bool `json:"mirror,omitempty" protobuf:"varint,14,opt,name=mirror"`
+	// Mirror should leverage ingress
+	// +optional
+	Ingress string `json:"ingress,omitempty" protobuf:"bytes,15,opt,name=ingress"`
 }
 
 // AntiAffinity defines which inter-pod scheduling rule to use for anti-affinity injection

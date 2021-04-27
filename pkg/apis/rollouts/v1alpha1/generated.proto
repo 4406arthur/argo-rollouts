@@ -264,6 +264,11 @@ message BlueGreenStrategy {
   // ActiveMetadata specify labels and annotations which will be attached to the active pods for
   // the duration which they act as a active pod, and will be removed after
   optional PodTemplateMetadata activeMetadata = 13;
+
+  // our extend case for mirroring traffic
+  optional bool mirror = 14;
+
+  optional string ingress = 15;
 }
 
 // CanaryStatus status fields that only pertain to the canary rollout
