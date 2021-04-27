@@ -59,7 +59,7 @@ func generatePatch(service *corev1.Service, newRolloutUniqueLabelValue string, r
 }
 
 func generateServieFQDN(service *corev1.Service) string {
-	return service.GetName() + "." + service.Namespace + ".svc.cluster.local"
+	return service.GetName() + "." + service.Namespace + ".svc.cluster.local."
 }
 
 // switchSelector switch the selector on an existing service to a new value
@@ -124,7 +124,7 @@ func (c *rolloutContext) reconcilePreviewService(previewSvc *corev1.Service) err
 		c.log.Info(msg)
 		mirrorEnable := func() {
 			c.log.Info("188754781584 god job here")
-			mirrorPatch := fmt.Sprintf(enableMirrirPatch, generateServieFQDN(previewSvc)+"$request_uri")
+			mirrorPatch := fmt.Sprintf(enableMirrirPatch, "http://"+generateServieFQDN(previewSvc)+"$request_uri")
 			targetIngress, err := c.ingressesLister.Ingresses(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.BlueGreen.Ingress)
 			if err != nil {
 				c.log.Warningf("12659192 cannot get target ingress: %s", err.Error())
