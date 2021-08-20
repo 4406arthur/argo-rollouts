@@ -24,7 +24,9 @@ import (
 	"github.com/argoproj/argo-rollouts/utils/diff"
 	experimentutil "github.com/argoproj/argo-rollouts/utils/experiment"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
+	"github.com/argoproj/argo-rollouts/utils/record"
 	replicasetutil "github.com/argoproj/argo-rollouts/utils/replicaset"
+	rolloututil "github.com/argoproj/argo-rollouts/utils/rollout"
 )
 
 // getAllReplicaSetsAndSyncRevision returns all the replica sets for the provided rollout (new and all old), with new RS's and rollout's revision updated.
@@ -85,18 +87,8 @@ func (c *rolloutContext) syncReplicaSetRevision() (*appsv1.ReplicaSet, error) {
 	}
 
 	// Should use the revision in existingNewRS's annotation, since it set by before
-	if annotations.SetRolloutRevision(c.rollout, rsCopy.Annotations[annotations.RevisionAnnotation]) {
-		updatedRollout, err := c.argoprojclientset.ArgoprojV1alpha1().Rollouts(c.rollout.Namespace).Update(ctx, c.rollout, metav1.UpdateOptions{})
-		if err != nil {
-			c.log.WithError(err).Error("Error: updating rollout revision")
-			return nil, err
-		}
-		c.rollout = updatedRollout.DeepCopy()
-		if err := c.refResolver.Resolve(c.rollout); err != nil {
-			return nil, err
-		}
-		c.newRollout = updatedRollout
-		c.log.Infof("Updated rollout revision annotation to %s", rsCopy.Annotations[annotations.RevisionAnnotation])
+	if err := c.setRolloutRevision(rsCopy.Annotations[annotations.RevisionAnnotation]); err != nil {
+		return nil, err
 	}
 
 	// If no other Progressing condition has been recorded and we need to estimate the progress
@@ -117,6 +109,23 @@ func (c *rolloutContext) syncReplicaSetRevision() (*appsv1.ReplicaSet, error) {
 		c.log.Infof("Initialized Progressing condition: %v", condition)
 	}
 	return rsCopy, nil
+}
+
+func (c *rolloutContext) setRolloutRevision(revision string) error {
+	if annotations.SetRolloutRevision(c.rollout, revision) {
+		updatedRollout, err := c.argoprojclientset.ArgoprojV1alpha1().Rollouts(c.rollout.Namespace).Update(context.TODO(), c.rollout, metav1.UpdateOptions{})
+		if err != nil {
+			c.log.WithError(err).Error("Error: updating rollout revision")
+			return err
+		}
+		c.rollout = updatedRollout.DeepCopy()
+		if err := c.refResolver.Resolve(c.rollout); err != nil {
+			return err
+		}
+		c.newRollout = updatedRollout
+		c.recorder.Eventf(c.rollout, record.EventOptions{EventReason: conditions.RolloutUpdatedReason}, conditions.RolloutUpdatedMessage, revision)
+	}
+	return nil
 }
 
 func (c *rolloutContext) createDesiredReplicaSet() (*appsv1.ReplicaSet, error) {
@@ -225,7 +234,7 @@ func (c *rolloutContext) createDesiredReplicaSet() (*appsv1.ReplicaSet, error) {
 		return nil, err
 	case err != nil:
 		msg := fmt.Sprintf(conditions.FailedRSCreateMessage, newRS.Name, err)
-		c.recorder.Event(c.rollout, corev1.EventTypeWarning, conditions.FailedRSCreateReason, msg)
+		c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: conditions.FailedRSCreateReason}, msg)
 		newStatus := c.rollout.Status.DeepCopy()
 		cond := conditions.NewRolloutCondition(v1alpha1.RolloutProgressing, corev1.ConditionFalse, conditions.FailedRSCreateReason, msg)
 		patchErr := c.patchCondition(c.rollout, newStatus, cond)
@@ -237,22 +246,15 @@ func (c *rolloutContext) createDesiredReplicaSet() (*appsv1.ReplicaSet, error) {
 		c.log.Infof("Created ReplicaSet %s", createdRS.Name)
 	}
 
+	if err := c.setRolloutRevision(newRevision); err != nil {
+		return nil, err
+	}
+
 	if !alreadyExists && newReplicasCount > 0 {
-		c.recorder.Eventf(c.rollout, corev1.EventTypeNormal, "ScalingReplicaSet", "Scaled up replica set %s to %d", createdRS.Name, newReplicasCount)
+		revision, _ := replicasetutil.Revision(createdRS)
+		c.recorder.Eventf(c.rollout, record.EventOptions{EventReason: conditions.NewReplicaSetReason}, conditions.NewReplicaSetDetailedMessage, createdRS.Name, revision, newReplicasCount)
 	}
 
-	if annotations.SetRolloutRevision(c.rollout, newRevision) {
-		updatedRollout, err := c.argoprojclientset.ArgoprojV1alpha1().Rollouts(c.rollout.Namespace).Update(ctx, c.rollout, metav1.UpdateOptions{})
-		if err != nil {
-			return nil, err
-		}
-		c.rollout = updatedRollout
-		if err := c.refResolver.Resolve(c.rollout); err != nil {
-			return nil, err
-		}
-
-		c.log.Infof("Updated rollout revision to %s", c.rollout.Annotations[annotations.RevisionAnnotation])
-	}
 	if !alreadyExists {
 		msg := fmt.Sprintf(conditions.NewReplicaSetMessage, createdRS.Name)
 		condition := conditions.NewRolloutCondition(v1alpha1.RolloutProgressing, corev1.ConditionTrue, conditions.NewReplicaSetReason, msg)
@@ -394,7 +396,8 @@ func (c *rolloutContext) scaleReplicaSet(rs *appsv1.ReplicaSet, newScale int32, 
 		rs, err = c.kubeclientset.AppsV1().ReplicaSets(rsCopy.Namespace).Update(ctx, rsCopy, metav1.UpdateOptions{})
 		if err == nil && sizeNeedsUpdate {
 			scaled = true
-			c.recorder.Eventf(rollout, corev1.EventTypeNormal, "ScalingReplicaSet", "Scaled %s replica set %s from %d to %d", scalingOperation, rs.Name, oldScale, newScale)
+			revision, _ := replicasetutil.Revision(rs)
+			c.recorder.Eventf(rollout, record.EventOptions{EventReason: conditions.ScalingReplicaSetReason}, conditions.ScalingReplicaSetMessage, scalingOperation, rs.Name, revision, oldScale, newScale)
 		}
 	}
 	return scaled, rs, err
@@ -416,7 +419,7 @@ func (c *rolloutContext) calculateBaseStatus() v1alpha1.RolloutStatus {
 		// to happen, the user would have had to simultaneously change the number of replicas, and
 		// the pod template spec at the same time.
 		currentPodHash = controller.ComputeHash(&c.rollout.Spec.Template, c.rollout.Status.CollisionCount)
-		c.log.Warnf("Assuming %s for new replicaset pod hash", currentPodHash)
+		c.log.Infof("Assuming %s for new replicaset pod hash", currentPodHash)
 	} else {
 		currentPodHash = c.newRS.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
 	}
@@ -495,7 +498,7 @@ func (c *rolloutContext) reconcileRevisionHistoryLimit(oldRSs []*appsv1.ReplicaS
 func (c *rolloutContext) checkPausedConditions() error {
 	// Progressing condition
 	progCond := conditions.GetRolloutCondition(c.rollout.Status, v1alpha1.RolloutProgressing)
-	progCondPaused := progCond != nil && progCond.Reason == conditions.PausedRolloutReason
+	progCondPaused := progCond != nil && progCond.Reason == conditions.RolloutPausedReason
 
 	isPaused := len(c.rollout.Status.PauseConditions) > 0 || c.rollout.Spec.Paused
 	abortCondExists := progCond != nil && progCond.Reason == conditions.RolloutAbortedReason
@@ -504,9 +507,9 @@ func (c *rolloutContext) checkPausedConditions() error {
 
 	if (isPaused != progCondPaused) && !abortCondExists {
 		if isPaused {
-			updatedConditions = append(updatedConditions, conditions.NewRolloutCondition(v1alpha1.RolloutProgressing, corev1.ConditionUnknown, conditions.PausedRolloutReason, conditions.PausedRolloutMessage))
+			updatedConditions = append(updatedConditions, conditions.NewRolloutCondition(v1alpha1.RolloutProgressing, corev1.ConditionUnknown, conditions.RolloutPausedReason, conditions.RolloutPausedMessage))
 		} else {
-			updatedConditions = append(updatedConditions, conditions.NewRolloutCondition(v1alpha1.RolloutProgressing, corev1.ConditionUnknown, conditions.ResumedRolloutReason, conditions.ResumeRolloutMessage))
+			updatedConditions = append(updatedConditions, conditions.NewRolloutCondition(v1alpha1.RolloutProgressing, corev1.ConditionUnknown, conditions.RolloutResumedReason, conditions.RolloutResumedMessage))
 		}
 	}
 
@@ -522,7 +525,7 @@ func (c *rolloutContext) checkPausedConditions() error {
 		if isPaused {
 			condStatus = corev1.ConditionTrue
 		}
-		updatedConditions = append(updatedConditions, conditions.NewRolloutCondition(v1alpha1.RolloutPaused, condStatus, conditions.PausedRolloutReason, conditions.PausedRolloutMessage))
+		updatedConditions = append(updatedConditions, conditions.NewRolloutCondition(v1alpha1.RolloutPaused, condStatus, conditions.RolloutPausedReason, conditions.RolloutPausedMessage))
 	}
 
 	if len(updatedConditions) == 0 {
@@ -540,6 +543,8 @@ func (c *rolloutContext) patchCondition(r *v1alpha1.Rollout, newStatus *v1alpha1
 		conditions.SetRolloutCondition(newStatus, *condition)
 	}
 	newStatus.ObservedGeneration = strconv.Itoa(int(c.rollout.Generation))
+	newStatus.Phase, newStatus.Message = rolloututil.CalculateRolloutPhase(r.Spec, *newStatus)
+
 	logCtx := logutil.WithVersionFields(c.log, r)
 	patch, modified, err := diff.CreateTwoWayMergePatch(
 		&v1alpha1.Rollout{
@@ -556,12 +561,13 @@ func (c *rolloutContext) patchCondition(r *v1alpha1.Rollout, newStatus *v1alpha1
 		logCtx.Info("No status changes. Skipping patch")
 		return nil
 	}
-	_, err = c.argoprojclientset.ArgoprojV1alpha1().Rollouts(r.Namespace).Patch(ctx, r.Name, patchtypes.MergePatchType, patch, metav1.PatchOptions{}, "status")
+	newRollout, err := c.argoprojclientset.ArgoprojV1alpha1().Rollouts(r.Namespace).Patch(ctx, r.Name, patchtypes.MergePatchType, patch, metav1.PatchOptions{}, "status")
 	if err != nil {
 		logCtx.Warnf("Error patching rollout: %v", err)
 		return err
 	}
 	logCtx.Infof("Patched conditions: %s", string(patch))
+	c.newRollout = newRollout
 	return nil
 }
 
@@ -574,6 +580,7 @@ func isIndefiniteStep(r *v1alpha1.Rollout) bool {
 
 func (c *rolloutContext) calculateRolloutConditions(newStatus v1alpha1.RolloutStatus) v1alpha1.RolloutStatus {
 	isPaused := len(c.rollout.Status.PauseConditions) > 0 || c.rollout.Spec.Paused
+	isAborted := c.pauseContext.IsAborted()
 
 	completeCond := conditions.GetRolloutCondition(c.rollout.Status, v1alpha1.RolloutCompleted)
 	if !isPaused && conditions.RolloutComplete(c.rollout, &newStatus) {
@@ -583,6 +590,18 @@ func (c *rolloutContext) calculateRolloutConditions(newStatus v1alpha1.RolloutSt
 		if completeCond != nil {
 			updateCompletedCond := conditions.NewRolloutCondition(v1alpha1.RolloutCompleted, corev1.ConditionFalse, conditions.RolloutCompletedReason, conditions.RolloutCompletedReason)
 			conditions.SetRolloutCondition(&newStatus, *updateCompletedCond)
+		}
+	}
+
+	if isAborted {
+		revision, _ := replicasetutil.Revision(c.rollout)
+		message := fmt.Sprintf(conditions.RolloutAbortedMessage, revision)
+		if c.pauseContext.abortMessage != "" {
+			message = fmt.Sprintf("%s: %s", message, c.pauseContext.abortMessage)
+		}
+		condition := conditions.NewRolloutCondition(v1alpha1.RolloutProgressing, corev1.ConditionFalse, conditions.RolloutAbortedReason, message)
+		if conditions.SetRolloutCondition(&newStatus, *condition) {
+			c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: conditions.RolloutAbortedReason}, message)
 		}
 	}
 
@@ -596,24 +615,17 @@ func (c *rolloutContext) calculateRolloutConditions(newStatus v1alpha1.RolloutSt
 	currentCond := conditions.GetRolloutCondition(c.rollout.Status, v1alpha1.RolloutProgressing)
 
 	isCompleteRollout := newStatus.Replicas == newStatus.AvailableReplicas && currentCond != nil && currentCond.Reason == conditions.NewRSAvailableReason && currentCond.Type != v1alpha1.RolloutProgressing
-	// Check for progress only if the latest rollout hasn't completed yet.
-	if !isCompleteRollout {
+	// Check for progress. Only do this if the latest rollout hasn't completed yet and it is not aborted
+	if !isCompleteRollout && !isAborted {
 		switch {
-		case c.pauseContext.IsAborted():
-			var condition *v1alpha1.RolloutCondition
-			if c.pauseContext.abortMessage != "" {
-				condition = conditions.NewRolloutCondition(v1alpha1.RolloutProgressing, corev1.ConditionFalse, conditions.RolloutAbortedReason, c.pauseContext.abortMessage)
-			} else {
-				condition = conditions.NewRolloutCondition(v1alpha1.RolloutProgressing, corev1.ConditionFalse, conditions.RolloutAbortedReason, conditions.RolloutAbortedMessage)
-			}
-			conditions.SetRolloutCondition(&newStatus, *condition)
 		case conditions.RolloutComplete(c.rollout, &newStatus):
 			// Update the rollout conditions with a message for the new replica set that
 			// was successfully deployed. If the condition already exists, we ignore this update.
-			msg := fmt.Sprintf(conditions.RolloutCompletedMessage, c.rollout.Name)
+			rsName := ""
 			if c.newRS != nil {
-				msg = fmt.Sprintf(conditions.ReplicaSetCompletedMessage, c.newRS.Name)
+				rsName = c.newRS.Name
 			}
+			msg := fmt.Sprintf(conditions.ReplicaSetCompletedMessage, rsName)
 			progressingCondition := conditions.NewRolloutCondition(v1alpha1.RolloutProgressing, corev1.ConditionTrue, conditions.NewRSAvailableReason, msg)
 			conditions.SetRolloutCondition(&newStatus, *progressingCondition)
 		case conditions.RolloutProgressing(c.rollout, &newStatus):
@@ -676,12 +688,16 @@ func (c *rolloutContext) calculateRolloutConditions(newStatus v1alpha1.RolloutSt
 // persistRolloutStatus persists updates to rollout status. If no changes were made, it is a no-op
 func (c *rolloutContext) persistRolloutStatus(newStatus *v1alpha1.RolloutStatus) error {
 	ctx := context.TODO()
+	logCtx := logutil.WithVersionFields(c.log, c.rollout)
+
+	prevStatus := c.rollout.Status
 	c.pauseContext.CalculatePauseStatus(newStatus)
 	newStatus.ObservedGeneration = strconv.Itoa(int(c.rollout.Generation))
-	logCtx := logutil.WithVersionFields(c.log, c.rollout)
+	newStatus.Phase, newStatus.Message = rolloututil.CalculateRolloutPhase(c.rollout.Spec, *newStatus)
+
 	patch, modified, err := diff.CreateTwoWayMergePatch(
 		&v1alpha1.Rollout{
-			Status: c.rollout.Status,
+			Status: prevStatus,
 		},
 		&v1alpha1.Rollout{
 			Status: *newStatus,
@@ -695,14 +711,33 @@ func (c *rolloutContext) persistRolloutStatus(newStatus *v1alpha1.RolloutStatus)
 		c.requeueStuckRollout(*newStatus)
 		return nil
 	}
+
 	newRollout, err := c.argoprojclientset.ArgoprojV1alpha1().Rollouts(c.rollout.Namespace).Patch(ctx, c.rollout.Name, patchtypes.MergePatchType, patch, metav1.PatchOptions{}, "status")
 	if err != nil {
 		logCtx.Warningf("Error updating rollout: %v", err)
 		return err
 	}
+
+	c.sendStateChangeEvents(&prevStatus, newStatus)
 	logCtx.Infof("Patched: %s", patch)
 	c.newRollout = newRollout
 	return nil
+}
+
+// sendStateChangeEvents emit rollout events on significant state changes
+func (c *rolloutContext) sendStateChangeEvents(prevStatus, newStatus *v1alpha1.RolloutStatus) {
+	prevPaused := len(prevStatus.PauseConditions) > 0
+	currPaused := len(newStatus.PauseConditions) > 0
+	currAborted := newStatus.AbortedAt != nil
+	if prevPaused != currPaused {
+		if currPaused {
+			c.recorder.Eventf(c.rollout, record.EventOptions{EventReason: conditions.RolloutPausedReason}, conditions.RolloutPausedMessage+fmt.Sprintf(" (%s)", newStatus.PauseConditions[0].Reason))
+		} else if !currAborted {
+			// we check currAborted, because an abort will also clear status.pauseConditions
+			// which should not be mistaken as a RolloutResumed
+			c.recorder.Eventf(c.rollout, record.EventOptions{EventReason: conditions.RolloutResumedReason}, conditions.RolloutResumedMessage)
+		}
+	}
 }
 
 // used for unit testing
@@ -877,9 +912,9 @@ func (c *rolloutContext) promoteStable(newStatus *v1alpha1.RolloutStatus, reason
 	if previousStableHash != newStatus.CurrentPodHash {
 		// only emit this event when we switched stable
 		newStatus.StableRS = newStatus.CurrentPodHash
-		msg := fmt.Sprintf("Set stable to revision %s (%s): %s", c.rollout.Annotations[annotations.RevisionAnnotation], newStatus.CurrentPodHash, reason)
-		c.log.Info(msg)
-		c.recorder.Event(c.rollout, corev1.EventTypeNormal, "SetStable", msg)
+		revision, _ := replicasetutil.Revision(c.rollout)
+		c.recorder.Eventf(c.rollout, record.EventOptions{EventReason: conditions.RolloutCompletedReason},
+			conditions.RolloutCompletedMessage, revision, newStatus.CurrentPodHash, reason)
 		// Now that we've marked the desired RS as stable, start the scale-down countdown on the previous stable RS
 		previousStableRS, _ := replicasetutil.GetReplicaSetByTemplateHash(c.olderRSs, previousStableHash)
 		if replicasetutil.GetReplicaCountForReplicaSets([]*appsv1.ReplicaSet{previousStableRS}) > 0 {

@@ -18,6 +18,7 @@ import (
 	analysisutil "github.com/argoproj/argo-rollouts/utils/analysis"
 	"github.com/argoproj/argo-rollouts/utils/annotations"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
+	"github.com/argoproj/argo-rollouts/utils/record"
 	replicasetutil "github.com/argoproj/argo-rollouts/utils/replicaset"
 )
 
@@ -68,14 +69,11 @@ func (c *Controller) getAnalysisRunsForRollout(rollout *v1alpha1.Rollout) ([]*v1
 }
 
 func (c *rolloutContext) reconcileAnalysisRuns() error {
-	if c.pauseContext.IsAborted() || c.rollout.Status.PromoteFull {
-		allArs := append(c.currentArs.ToArray(), c.otherArs...)
-		c.SetCurrentAnalysisRuns(c.currentArs)
-		return c.cancelAnalysisRuns(allArs)
-	}
-
-	if replicasetutil.HasScaleDownDeadline(c.newRS) {
-		c.log.Infof("Skipping analysis: detected rollback to ReplicaSet '%s' within scaleDownDelay", c.newRS.Name)
+	isAborted := c.pauseContext.IsAborted()
+	rollbackToScaleDownDelay := replicasetutil.HasScaleDownDeadline(c.newRS)
+	initialDeploy := c.rollout.Status.StableRS == ""
+	if isAborted || c.rollout.Status.PromoteFull || rollbackToScaleDownDelay || initialDeploy {
+		c.log.Infof("Skipping analysis: isAborted: %v, promoteFull: %v, rollbackToScaleDownDelay: %v, initialDeploy: %v", isAborted, c.rollout.Status.PromoteFull, rollbackToScaleDownDelay, initialDeploy)
 		allArs := append(c.currentArs.ToArray(), c.otherArs...)
 		c.SetCurrentAnalysisRuns(c.currentArs)
 		return c.cancelAnalysisRuns(allArs)
@@ -187,7 +185,7 @@ func (c *rolloutContext) emitAnalysisRunStatusChanges(prevStatus *v1alpha1.Rollo
 				eventType = corev1.EventTypeWarning
 			}
 			msg := fmt.Sprintf("%s Analysis Run '%s' Status New: '%s' Previous: '%s'", arType, ar.Name, ar.Status.Phase, prevStatusStr)
-			c.recorder.Event(c.rollout, eventType, "AnalysisRunStatusChange", msg)
+			c.recorder.Eventf(c.rollout, record.EventOptions{EventType: eventType, EventReason: "AnalysisRun" + string(ar.Status.Phase)}, msg)
 		}
 	}
 }

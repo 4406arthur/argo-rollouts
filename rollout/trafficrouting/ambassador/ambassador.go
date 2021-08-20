@@ -7,10 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
-	"github.com/argoproj/argo-rollouts/utils/defaults"
-	logutil "github.com/argoproj/argo-rollouts/utils/log"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -19,7 +17,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 
-	"k8s.io/client-go/tools/record"
+	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
+	"github.com/argoproj/argo-rollouts/utils/defaults"
+	logutil "github.com/argoproj/argo-rollouts/utils/log"
+	"github.com/argoproj/argo-rollouts/utils/record"
 )
 
 // Type defines the ambassador traffic routing type.
@@ -150,8 +151,19 @@ func (r *Reconciler) handleCanaryMapping(ctx context.Context, baseMappingName st
 	}
 
 	if desiredWeight == 0 {
-		r.Log.Infof("deleting canary mapping %q", canaryMapping.GetName())
-		return r.deleteCanaryMapping(ctx, canaryMapping, desiredWeight, r.Client)
+		defer func() {
+			// add buffer before scale down replica set
+			r.Log.Infof("sleep %d sec for propagation of mapping update", 5)
+			time.Sleep(5 * time.Second)
+			// The deletion of the canary mapping needs to happen moments after
+			// updating the weight to zero to prevent traffic to reach the older
+			// version at the end of the rollout
+			r.Log.Infof("deleting canary mapping %q", canaryMapping.GetName())
+			err := r.deleteCanaryMapping(ctx, canaryMapping, desiredWeight, r.Client)
+			if err != nil {
+				r.Log.Errorf("error deleting canary mapping: %s", err)
+			}
+		}()
 	}
 
 	r.Log.Infof("updating canary mapping %q weight to %d", canaryMapping.GetName(), desiredWeight)
@@ -305,7 +317,7 @@ func (r *Reconciler) sendWarningEvent(id, msg string) {
 }
 
 func (r *Reconciler) sendEvent(eventType, id, msg string) {
-	r.Recorder.Event(r.Rollout, eventType, id, msg)
+	r.Recorder.Eventf(r.Rollout, record.EventOptions{EventType: eventType, EventReason: id}, msg)
 }
 
 // UpdateHash informs a traffic routing reconciler about new canary/stable pod hashes

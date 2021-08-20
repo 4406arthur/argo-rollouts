@@ -3,8 +3,6 @@ package rollout
 import (
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/alb"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/ambassador"
@@ -12,6 +10,7 @@ import (
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/nginx"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/smi"
 
+	"github.com/argoproj/argo-rollouts/utils/record"
 	replicasetutil "github.com/argoproj/argo-rollouts/utils/replicaset"
 )
 
@@ -99,6 +98,10 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 	desiredWeight := int32(0)
 	if c.rollout.Status.StableRS == c.rollout.Status.CurrentPodHash {
 		// when we are fully promoted. desired canary weight should be 0
+	} else if c.pauseContext.IsAborted() {
+		// when promote aborted. desired canary weight should be 0
+	} else if c.newRS == nil || c.newRS.Status.AvailableReplicas == 0 {
+		// when newRS is not available or replicas num is 0. never weight to canary
 	} else if index != nil {
 		atDesiredReplicaCount := replicasetutil.AtDesiredReplicaCountsForCanary(c.rollout, c.newRS, c.stableRS, c.otherRSs)
 		if !atDesiredReplicaCount {
@@ -123,7 +126,7 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 
 	err = reconciler.SetWeight(desiredWeight)
 	if err != nil {
-		c.recorder.Event(c.rollout, corev1.EventTypeWarning, "TrafficRoutingError", err.Error())
+		c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: "TrafficRoutingError"}, err.Error())
 		return err
 	}
 

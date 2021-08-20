@@ -12,11 +12,11 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/dynamic/dynamiclister"
-	"k8s.io/client-go/tools/record"
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	testutil "github.com/argoproj/argo-rollouts/test/util"
 	istioutil "github.com/argoproj/argo-rollouts/utils/istio"
+	"github.com/argoproj/argo-rollouts/utils/record"
 	unstructuredutil "github.com/argoproj/argo-rollouts/utils/unstructured"
 )
 
@@ -128,7 +128,7 @@ func TestReconcileUpdateVirtualService(t *testing.T) {
 	client := testutil.NewFakeDynamicClient(obj)
 	ro := rollout("stable", "canary", "vsvc", []string{"primary"})
 	vsvcLister, druleLister := getIstioListers(client)
-	r := NewReconciler(ro, client, &record.FakeRecorder{}, vsvcLister, druleLister)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), vsvcLister, druleLister)
 	client.ClearActions()
 	err := r.SetWeight(10)
 	assert.Nil(t, err)
@@ -141,7 +141,7 @@ func TestReconcileNoChanges(t *testing.T) {
 	obj := unstructuredutil.StrToUnstructuredUnsafe(regularVsvc)
 	client := testutil.NewFakeDynamicClient(obj)
 	ro := rollout("stable", "canary", "vsvc", []string{"primary"})
-	r := NewReconciler(ro, client, &record.FakeRecorder{}, nil, nil)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), nil, nil)
 	err := r.SetWeight(0)
 	assert.Nil(t, err)
 	assert.Len(t, client.Actions(), 1)
@@ -153,7 +153,7 @@ func TestReconcileInvalidValidation(t *testing.T) {
 	client := testutil.NewFakeDynamicClient(obj)
 	ro := rollout("stable", "canary", "vsvc", []string{"route-not-found"})
 	vsvcLister, druleLister := getIstioListers(client)
-	r := NewReconciler(ro, client, &record.FakeRecorder{}, vsvcLister, druleLister)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), vsvcLister, druleLister)
 	client.ClearActions()
 	err := r.SetWeight(0)
 	assert.Equal(t, "Route 'route-not-found' is not found", err.Error())
@@ -163,7 +163,7 @@ func TestReconcileVirtualServiceNotFound(t *testing.T) {
 	client := testutil.NewFakeDynamicClient()
 	ro := rollout("stable", "canary", "vsvc", []string{"primary"})
 	vsvcLister, druleLister := getIstioListers(client)
-	r := NewReconciler(ro, client, &record.FakeRecorder{}, vsvcLister, druleLister)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), vsvcLister, druleLister)
 	client.ClearActions()
 	err := r.SetWeight(10)
 	assert.NotNil(t, err)
@@ -173,7 +173,7 @@ func TestReconcileVirtualServiceNotFound(t *testing.T) {
 func TestType(t *testing.T) {
 	client := testutil.NewFakeDynamicClient()
 	ro := rollout("stable", "canary", "vsvc", []string{"primary"})
-	r := NewReconciler(ro, client, &record.FakeRecorder{}, nil, nil)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), nil, nil)
 	assert.Equal(t, Type, r.Type())
 }
 
@@ -290,6 +290,18 @@ func TestValidateHosts(t *testing.T) {
 
 	err = validateVirtualServiceHTTPRouteDestinations(hr, "stable", "not-found-canary", nil)
 	assert.Equal(t, fmt.Errorf("Canary Service 'not-found-canary' not found in route"), err)
+
+	hr.Route = []VirtualServiceHTTPRouteDestination{{
+		Destination: VirtualServiceDestination{
+			Host: "stable.namespace",
+		},
+	}, {
+		Destination: VirtualServiceDestination{
+			Host: "canary.namespace",
+		},
+	}}
+	err = validateVirtualServiceHTTPRouteDestinations(hr, "stable", "canary", nil)
+	assert.Nil(t, err)
 }
 
 func TestValidateHTTPRoutesSubsets(t *testing.T) {
@@ -395,7 +407,7 @@ spec:
 `)
 	client := testutil.NewFakeDynamicClient(obj)
 	vsvcLister, druleLister := getIstioListers(client)
-	r := NewReconciler(ro, client, &record.FakeRecorder{}, vsvcLister, druleLister)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), vsvcLister, druleLister)
 	client.ClearActions()
 
 	err := r.UpdateHash("abc123", "def456")
@@ -435,7 +447,7 @@ spec:
 `)
 	client := testutil.NewFakeDynamicClient(obj)
 	vsvcLister, druleLister := getIstioListers(client)
-	r := NewReconciler(ro, client, &record.FakeRecorder{}, vsvcLister, druleLister)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), vsvcLister, druleLister)
 	client.ClearActions()
 
 	err := r.UpdateHash("abc123", "def456")
@@ -459,7 +471,7 @@ spec:
   - name: canary
 `)
 	client := testutil.NewFakeDynamicClient(obj)
-	r := NewReconciler(ro, client, &record.FakeRecorder{}, nil, nil)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), nil, nil)
 	client.ClearActions()
 
 	err := r.UpdateHash("abc123", "def456")
@@ -482,7 +494,7 @@ func TestUpdateHashDestinationRuleNotFound(t *testing.T) {
 	ro := rolloutWithDestinationRule()
 	client := testutil.NewFakeDynamicClient()
 	vsvcLister, druleLister := getIstioListers(client)
-	r := NewReconciler(ro, client, &record.FakeRecorder{}, vsvcLister, druleLister)
+	r := NewReconciler(ro, client, record.NewFakeEventRecorder(), vsvcLister, druleLister)
 	client.ClearActions()
 
 	err := r.UpdateHash("abc123", "def456")

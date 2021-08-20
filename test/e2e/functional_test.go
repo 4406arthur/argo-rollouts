@@ -3,18 +3,22 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"github.com/argoproj/argo-rollouts/controller"
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/test/fixtures"
 )
@@ -33,30 +37,81 @@ func (s *FunctionalSuite) SetupSuite() {
 	s.ApplyManifests("@functional/analysistemplate-sleep-job.yaml")
 }
 
-func countReplicaSets(count int) fixtures.ReplicaSetExpectation {
-	return func(rsets *appsv1.ReplicaSetList) bool {
-		return len(rsets.Items) == count
-	}
-}
-
 func (s *FunctionalSuite) TestRolloutAbortRetryPromote() {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
 	s.Given().
-		HealthyRollout(`@functional/rollout-basic.yaml`).
+		StartEventWatch(ctx).
+		HealthyRollout(`
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: abort-retry-promote
+spec:
+  strategy:
+    canary: 
+      steps:
+      - setWeight: 50
+      - pause: {duration: 3s}
+  selector:
+    matchLabels:
+      app: abort-retry-promote
+  template:
+    metadata:
+      labels:
+        app: abort-retry-promote
+    spec:
+      containers:
+      - name: abort-retry-promote
+        image: nginx:1.19-alpine
+        resources:
+          requests:
+            memory: 16Mi
+            cpu: 1m
+`).
 		When().
 		UpdateSpec().
 		WaitForRolloutStatus("Paused").
 		Then().
-		ExpectReplicaSets("two replicasets", countReplicaSets(2)).
+		ExpectRevisionPodCount("1", 1).
+		ExpectRevisionPodCount("2", 1).
 		When().
 		AbortRollout().
 		WaitForRolloutStatus("Degraded").
 		RetryRollout().
 		WaitForRolloutStatus("Paused").
-		PromoteRollout().
-		WaitForRolloutStatus("Healthy")
+		Then().
+		ExpectRevisionPodCount("1", 1).
+		ExpectRevisionPodCount("2", 1).
+		When().
+		WaitForRolloutStatus("Healthy"). // will auto-promote after `pause: {duration: 3s}` step
+		Then().
+		ExpectRevisionPodCount("1", 0).
+		ExpectRevisionPodCount("2", 1).
+		ExpectRolloutEvents([]string{
+			"RolloutUpdated",       // Rollout updated to revision 1
+			"NewReplicaSetCreated", // Created ReplicaSet abort-retry-promote-698fbfb9dc (revision 1) with size 1
+			"RolloutCompleted",     // Rollout completed update to revision 1 (698fbfb9dc): Initial deploy
+			"RolloutUpdated",       // Rollout updated to revision 2
+			"NewReplicaSetCreated", // Created ReplicaSet abort-retry-promote-75dcb5ddd6 (revision 2) with size 1
+			"RolloutStepCompleted", // Rollout step 1/2 completed (setWeight: 50)
+			"RolloutPaused",        // Rollout is paused (CanaryPauseStep)
+			"ScalingReplicaSet",    // Scaled down ReplicaSet abort-retry-promote-75dcb5ddd6 (revision 2) from 1 to 0
+			"RolloutAborted",       // Rollout aborted update to revision 2
+			"ScalingReplicaSet",    // Scaled up ReplicaSet abort-retry-promote-75dcb5ddd6 (revision 2) from 0 to 1
+			"RolloutStepCompleted", // Rollout step 1/2 completed (setWeight: 50)
+			"RolloutPaused",        // Rollout is paused (CanaryPauseStep)
+			"RolloutStepCompleted", // Rollout step 2/2 completed (pause: 3s)
+			"RolloutResumed",       // Rollout is resumed
+			"ScalingReplicaSet",    // Scaled down ReplicaSet abort-retry-promote-698fbfb9dc (revision 1) from 1 to 0
+			"RolloutCompleted",     // Rollout completed update to revision 2 (75dcb5ddd6): Completed all 2 canary steps
+		})
 }
 
-// TestCanaryPromoteFull verifies behavior when performing full promotion with a canary strategy
+// TestCanaryPromoteFull verifies promotion of a canary under the following scenarios:
+// 1. at a pause step with duration
+// 2. in the middle of analysis
+// 3. full promotion after abort
 func (s *FunctionalSuite) TestCanaryPromoteFull() {
 	s.Given().
 		HealthyRollout(`
@@ -65,17 +120,26 @@ kind: Rollout
 metadata:
   name: canary-promote-full
 spec:
-  replicas: 3
   strategy:
     canary:
-      maxUnavailable: 0
+      # this analysis should not run because it has a starting step of 4 which we never get to
       analysis:
         templates:
         - templateName: sleep-job
-        startingStep: 2
+        startingStep: 4
+
       steps:
+      - pause: {duration: 24h}
+      - analysis:
+          templates:
+          - templateName: sleep-job
+          args:
+          - name: duration
+            value: 24h
       - pause: {}
-      - pause: {}
+      - analysis: # we should never get to step 4
+          templates:
+          - templateName: sleep-job
   selector:
     matchLabels:
       app: canary-promote-full
@@ -94,12 +158,27 @@ spec:
 `).
 		When().
 		UpdateSpec().
+		WaitForRolloutStatus("Paused"). // At step 1 (pause: {duration: 24h})
+		PromoteRollout().
+		Sleep(2*time.Second).
+		Then().
+		ExpectRollout("status.currentStepIndex == 1", func(r *v1alpha1.Rollout) bool {
+			return *r.Status.CurrentStepIndex == 1
+		}).
+		ExpectRolloutStatus("Progressing"). // At step 2 (analysis: sleep-job - 24h)
+		ExpectAnalysisRunCount(1).
+		When().
+		PromoteRollout().
+		Sleep(2 * time.Second).
+		WaitForRolloutStatus("Paused"). // At step 3 (pause: {})
 		AbortRollout().
+		Then().
+		When().
 		Sleep(time.Second).
 		PromoteRolloutFull().
 		WaitForRolloutStatus("Healthy").
 		Then().
-		ExpectAnalysisRunCount(0)
+		ExpectAnalysisRunCount(1) // no new analysis was created
 }
 
 // TestBlueGreenPromoteFull verifies behavior when performing full promotion with a blue-green strategy
@@ -597,7 +676,10 @@ spec:
 
 // TestBlueGreenUpdate
 func (s *FunctionalSuite) TestBlueGreenUpdate() {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
 	s.Given().
+		StartEventWatch(ctx).
 		HealthyRollout("@functional/rollout-bluegreen.yaml").
 		When().
 		Then().
@@ -611,7 +693,17 @@ func (s *FunctionalSuite) TestBlueGreenUpdate() {
 		When().
 		WaitForRolloutStatus("Healthy").
 		Then().
-		ExpectReplicaCounts(3, 6, 3, 3, 3)
+		ExpectReplicaCounts(3, 6, 3, 3, 3).
+		ExpectRolloutEvents([]string{
+			"RolloutUpdated",       // Rollout updated to revision 1
+			"NewReplicaSetCreated", // Created ReplicaSet bluegreen-7dcd8f8869 (revision 1) with size 3
+			"RolloutCompleted",     // Rollout completed update to revision 1 (7dcd8f8869): Initial deploy
+			"SwitchService",        // Switched selector for service 'bluegreen' from '' to '7dcd8f8869'
+			"RolloutUpdated",       // Rollout updated to revision 2
+			"NewReplicaSetCreated", // Created ReplicaSet bluegreen-5498785cd6 (revision 2) with size 3
+			"SwitchService",        // Switched selector for service 'bluegreen' from '7dcd8f8869' to '6c779b88b6'
+			"RolloutCompleted",     // Rollout completed update to revision 2 (6c779b88b6): Completed blue-green update
+		})
 }
 
 // TestBlueGreenPreviewReplicaCount verifies the previewReplicaCount feature
@@ -846,123 +938,127 @@ spec:
 
 func (s *FunctionalSuite) TestKubectlWaitForPaused() {
 	s.Given().
-		RolloutObjects(`
+		HealthyRollout(`
 kind: Service
 apiVersion: v1
 metadata:
-  name: rollout-bluegreen-active
+  name: kubectl-wait-paused
 spec:
   selector:
-    app: rollout-bluegreen
+    app: kubectl-wait-paused
   ports:
   - protocol: TCP
     port: 80
-    targetPort: 8080
+    targetPort: 80
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
-  name: rollout-bluegreen
+  name: kubectl-wait-paused
 spec:
   replicas: 1
-  revisionHistoryLimit: 2
   selector:
     matchLabels:
-      app: rollout-bluegreen
+      app: kubectl-wait-paused
   template:
     metadata:
       labels:
-        app: rollout-bluegreen
+        app: kubectl-wait-paused
     spec:
       containers:
-      - name: rollouts-demo
-        image: argoproj/rollouts-demo:blue
+      - name: kubectl-wait-paused
+        image: nginx:1.19-alpine
         imagePullPolicy: Always
         ports:
-        - containerPort: 8080
+        - containerPort: 80
   strategy:
     blueGreen:
-      activeService: rollout-bluegreen-active
+      activeService: kubectl-wait-paused
       autoPromotionEnabled: false
 `).
 		When().
-		ApplyManifests().
-		WaitForRolloutReplicas(1).
-		WaitForRolloutStatus("Healthy").
 		UpdateSpec().
 		Then().
-		ExpectRollout("Paused", func(r *v1alpha1.Rollout) bool {
+		ExpectRollout("Paused=True", func(r *v1alpha1.Rollout) bool {
 			cmd := exec.Command("kubectl", "wait", "--for=condition=Paused", fmt.Sprintf("rollout/%s", r.Name))
 			out, err := cmd.CombinedOutput()
-			return err == nil && strings.Contains(string(out), "rollout.argoproj.io/rollout-bluegreen condition met")
+			return err == nil && strings.Contains(string(out), fmt.Sprintf("rollout.argoproj.io/%s condition met", r.Name))
 		}).
+		ExpectRolloutStatus("Paused").
+		ExpectActiveRevision("1").
 		When().
 		PromoteRollout().
 		Then().
-		ExpectRollout("UnPaused", func(r *v1alpha1.Rollout) bool {
+		ExpectRollout("Paused=False", func(r *v1alpha1.Rollout) bool {
 			cmd := exec.Command("kubectl", "wait", "--for=condition=Paused=False", fmt.Sprintf("rollout/%s", r.Name))
-			return cmd.Run() == nil
+			out, err := cmd.CombinedOutput()
+			return err == nil && strings.Contains(string(out), fmt.Sprintf("rollout.argoproj.io/%s condition met", r.Name))
 		}).
+		ExpectRolloutStatus("Healthy").
 		ExpectActiveRevision("2")
 }
 
 func (s *FunctionalSuite) TestKubectlWaitForCompleted() {
 	s.Given().
-		RolloutObjects(`
+		HealthyRollout(`
 kind: Service
 apiVersion: v1
 metadata:
-  name: rollout-bluegreen-active
+  name: kubectl-wait-completed
 spec:
   selector:
-    app: rollout-bluegreen
+    app: kubectl-wait-completed
   ports:
   - protocol: TCP
     port: 80
-    targetPort: 8080
+    targetPort: 80
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
-  name: rollout-bluegreen
+  name: kubectl-wait-completed
 spec:
   replicas: 1
-  revisionHistoryLimit: 2
   selector:
     matchLabels:
-      app: rollout-bluegreen
+      app: kubectl-wait-completed
   template:
     metadata:
       labels:
-        app: rollout-bluegreen
+        app: kubectl-wait-completed
     spec:
       containers:
-      - name: rollouts-demo
-        image: argoproj/rollouts-demo:blue
+      - name: kubectl-wait-completed
+        image: nginx:1.19-alpine
         imagePullPolicy: Always
         ports:
-        - containerPort: 8080
+        - containerPort: 80
+        readinessProbe:
+          initialDelaySeconds: 5
+          httpGet:
+            path: /
+            port: 80
+          periodSeconds: 10
+
   strategy:
     blueGreen:
-      activeService: rollout-bluegreen-active
+      activeService: kubectl-wait-completed
       autoPromotionEnabled: true
 `).
 		When().
-		ApplyManifests().
-		WaitForRolloutReplicas(1).
-		WaitForRolloutStatus("Healthy").
 		UpdateSpec().
 		Then().
-		ExpectRollout("Completed", func(r *v1alpha1.Rollout) bool {
+		ExpectRollout("Completed=False", func(r *v1alpha1.Rollout) bool {
 			cmd := exec.Command("kubectl", "wait", "--for=condition=Completed=False", fmt.Sprintf("rollout/%s", r.Name))
-			return cmd.Run() == nil
+			out, err := cmd.CombinedOutput()
+			return err == nil && strings.Contains(string(out), fmt.Sprintf("rollout.argoproj.io/%s condition met", r.Name))
 		}).
-		When().
-		PromoteRollout().
-		Then().
-		ExpectRollout("Completed", func(r *v1alpha1.Rollout) bool {
+		ExpectRolloutStatus("Progressing").
+		ExpectActiveRevision("1").
+		ExpectRollout("Completed=True", func(r *v1alpha1.Rollout) bool {
 			cmd := exec.Command("kubectl", "wait", "--for=condition=Completed=True", fmt.Sprintf("rollout/%s", r.Name))
-			return cmd.Run() == nil
+			out, err := cmd.CombinedOutput()
+			return err == nil && strings.Contains(string(out), fmt.Sprintf("rollout.argoproj.io/%s condition met", r.Name))
 		}).
 		ExpectActiveRevision("2")
 }
@@ -976,31 +1072,11 @@ metadata:
   name: rollout-bluegreen-active
 spec:
   selector:
-    app: rollout-bluegreen
+    app: rollout-ref-deployment
   ports:
   - protocol: TCP
     port: 80
     targetPort: 8080
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  labels:
-    app.kubernetes.io/instance: rollout-canary
-  name: rollout-ref-deployment
-spec:
-  replicas: 0
-  selector:
-    matchLabels:
-      app: rollout-ref-deployment
-  template:
-    metadata:
-      labels:
-        app: rollout-ref-deployment
-    spec:
-      containers:
-        - name: rollouts-demo
-          image: argoproj/rollouts-demo:error
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
@@ -1023,7 +1099,33 @@ spec:
 		WaitForRolloutStatus("Degraded").
 		Then().
 		// verify that existing service is not switched to degraded rollout pods
-		ExpectServiceSelector("rollout-bluegreen-active", map[string]string{"app": "rollout-bluegreen"}, false).
+		ExpectServiceSelector("rollout-bluegreen-active", map[string]string{"app": "rollout-ref-deployment"}, false).
+		When().
+		ApplyManifests(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: rollout-canary
+  name: rollout-ref-deployment
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: rollout-ref-deployment
+  template:
+    metadata:
+      labels:
+        app: rollout-ref-deployment
+    spec:
+      containers:
+        - name: rollouts-demo
+          image: argoproj/rollouts-demo:green
+    `).
+		WaitForRolloutStatus("Healthy").
+		Then().
+		// verify that service is switched after rollout is healthy
+		ExpectServiceSelector("rollout-bluegreen-active", map[string]string{"app": "rollout-ref-deployment"}, true).
 		When().
 		UpdateResource(appsv1.SchemeGroupVersion.WithResource("deployments"), "rollout-ref-deployment", func(res *unstructured.Unstructured) error {
 			containers, _, err := unstructured.NestedSlice(res.Object, "spec", "template", "spec", "containers")
@@ -1032,15 +1134,52 @@ spec:
 			}
 			containers[0] = map[string]interface{}{
 				"name":  "rollouts-demo",
-				"image": "argoproj/rollouts-demo:green",
+				"image": "argoproj/rollouts-demo:error",
+			}
+			return unstructured.SetNestedSlice(res.Object, containers, "spec", "template", "spec", "containers")
+		}).
+		WaitForRolloutStatus("Degraded").
+		Then().
+		When().
+		UpdateResource(appsv1.SchemeGroupVersion.WithResource("deployments"), "rollout-ref-deployment", func(res *unstructured.Unstructured) error {
+			containers, _, err := unstructured.NestedSlice(res.Object, "spec", "template", "spec", "containers")
+			if err != nil {
+				return err
+			}
+			containers[0] = map[string]interface{}{
+				"name":  "rollouts-demo",
+				"image": "argoproj/rollouts-demo:blue",
 			}
 			return unstructured.SetNestedSlice(res.Object, containers, "spec", "template", "spec", "containers")
 		}).
 		WaitForRolloutStatus("Healthy").
+		UpdateSpec(`
+spec:
+  workloadRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: non-existent-deploy
+`).
+		WaitForRolloutStatus("Degraded").
+		UpdateSpec(`
+spec:
+  workloadRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rollout-ref-deployment
+`).
+		WaitForRolloutStatus("Healthy").
 		Then().
 		// verify that service is switched after rollout is healthy
-		ExpectServiceSelector("rollout-bluegreen-active", map[string]string{"app": "rollout-bluegreen"}, true).
+		ExpectServiceSelector("rollout-bluegreen-active", map[string]string{"app": "rollout-ref-deployment"}, true).
 		ExpectRollout("Resolved template not persisted", func(rollout *v1alpha1.Rollout) bool {
 			return rollout.Spec.Selector == nil && len(rollout.Spec.Template.Spec.Containers) == 0
 		})
+}
+
+// TestControllerMetrics is a basic test to verify prometheus /metrics endpoint is functional
+func (s *FunctionalSuite) TestControllerMetrics() {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/metrics", controller.DefaultMetricsPort))
+	assert.NoError(s.T(), err)
+	assert.Equal(s.T(), http.StatusOK, resp.StatusCode)
 }

@@ -10,13 +10,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	rov1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
-	"github.com/argoproj/argo-rollouts/pkg/kubectl-argo-rollouts/info"
 	"github.com/argoproj/argo-rollouts/utils/defaults"
 	replicasetutil "github.com/argoproj/argo-rollouts/utils/replicaset"
+	rolloututil "github.com/argoproj/argo-rollouts/utils/rollout"
+	"github.com/stretchr/testify/assert"
 )
 
 type Then struct {
-	Common
+	*Common
 }
 
 func (t *Then) Assert(assertFunc func(t *Then)) *Then {
@@ -40,8 +41,8 @@ func (t *Then) ExpectRollout(expectation string, expectFunc RolloutExpectation) 
 func (t *Then) ExpectRolloutStatus(expectedStatus string) *Then {
 	ro, err := t.rolloutClient.ArgoprojV1alpha1().Rollouts(t.namespace).Get(t.Context, t.rollout.GetName(), metav1.GetOptions{})
 	t.CheckError(err)
-	status, _ := info.RolloutStatusString(ro)
-	if status != expectedStatus {
+	status, _ := rolloututil.GetRolloutPhase(ro)
+	if string(status) != expectedStatus {
 		t.log.Errorf("Rollout status expected to be '%s'. actual: %s", expectedStatus, status)
 		t.t.FailNow()
 	}
@@ -318,6 +319,13 @@ func (t *Then) ExpectExperimentByRevisionPhase(revision string, phase string) *T
 			return string(run.Status.Phase) == phase
 		},
 	)
+}
+
+func (t *Then) ExpectRolloutEvents(reasons []string) *Then {
+	t.t.Helper()
+	eventReasons := t.GetRolloutEventReasons()
+	assert.Equal(t.Common.t, reasons, eventReasons)
+	return t
 }
 
 func (t *Then) When() *When {

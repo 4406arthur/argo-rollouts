@@ -27,12 +27,12 @@ import (
 	"github.com/argoproj/argo-rollouts/pkg/kubectl-argo-rollouts/cmd/promote"
 	"github.com/argoproj/argo-rollouts/pkg/kubectl-argo-rollouts/cmd/restart"
 	"github.com/argoproj/argo-rollouts/pkg/kubectl-argo-rollouts/cmd/retry"
-	"github.com/argoproj/argo-rollouts/pkg/kubectl-argo-rollouts/info"
+	rolloututil "github.com/argoproj/argo-rollouts/utils/rollout"
 	unstructuredutil "github.com/argoproj/argo-rollouts/utils/unstructured"
 )
 
 type When struct {
-	Common
+	*Common
 }
 
 func (w *When) ApplyManifests(yaml ...string) *When {
@@ -106,7 +106,7 @@ func (w *When) UpdateSpec(texts ...string) *When {
 	}
 	var patchBytes []byte
 	if len(texts) == 0 {
-		nowStr := time.Now().Format(time.RFC3339)
+		nowStr := time.Now().Format(time.RFC3339Nano)
 		patchBytes = []byte(fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"update":"%s"}}}}}`, nowStr))
 		w.log.Infof("Updated rollout pod spec: %s", nowStr)
 	} else {
@@ -234,8 +234,8 @@ func (w *When) PatchSpec(patch string) *When {
 
 func (w *When) WaitForRolloutStatus(status string, timeout ...time.Duration) *When {
 	checkStatus := func(ro *rov1.Rollout) bool {
-		s, _ := info.RolloutStatusString(ro)
-		return s == status
+		s, _ := rolloututil.GetRolloutPhase(ro)
+		return string(s) == status
 	}
 	return w.WaitForRolloutCondition(checkStatus, fmt.Sprintf("status=%s", status), timeout...)
 }
@@ -259,7 +259,7 @@ func (w *When) WaitForRolloutCanaryStepIndex(index int32, timeout ...time.Durati
 			//      WaitForRolloutCanaryStepIndex(N).
 			//      WaitForRolloutStatus("Paused").
 			// which would be annoying.
-			status, _ := info.RolloutStatusString(ro)
+			status, _ := rolloututil.GetRolloutPhase(ro)
 			return status == "Paused"
 		}
 		return true

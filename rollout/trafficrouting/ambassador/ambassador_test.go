@@ -9,6 +9,7 @@ import (
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/ambassador"
+	"github.com/argoproj/argo-rollouts/utils/record"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -16,7 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer/yaml"
-	"k8s.io/client-go/tools/record"
 )
 
 const (
@@ -194,7 +194,7 @@ func TestReconciler_SetWeight(t *testing.T) {
 	setup := func() *fixture {
 		r := rollout("main-service", "canary-service", []string{"myapp-mapping"})
 		fakeClient := &fakeClient{}
-		rec := &record.FakeRecorder{}
+		rec := record.NewFakeEventRecorder()
 		l, _ := test.NewNullLogger()
 		return &fixture{
 			rollout:    r,
@@ -310,7 +310,7 @@ func TestReconciler_SetWeight(t *testing.T) {
 			assert.Equal(t, 1, len(f.fakeClient.getInvokations))
 			assert.Equal(t, "myapp-mapping-canary", f.fakeClient.getInvokations[0].name)
 			assert.Equal(t, 0, len(f.fakeClient.createInvokations))
-			assert.Equal(t, 0, len(f.fakeClient.updateInvokations))
+			assert.Equal(t, 1, len(f.fakeClient.updateInvokations))
 			assert.Equal(t, 1, len(f.fakeClient.deleteInvokations))
 		})
 		t.Run("will return error if base mapping defines the weight", func(t *testing.T) {

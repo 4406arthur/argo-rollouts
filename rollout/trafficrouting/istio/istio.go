@@ -4,20 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	log "github.com/sirupsen/logrus"
-	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamiclister"
-	"k8s.io/client-go/tools/record"
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	istioutil "github.com/argoproj/argo-rollouts/utils/istio"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
+	"github.com/argoproj/argo-rollouts/utils/record"
 )
 
 const Type = "Istio"
@@ -101,7 +101,14 @@ func (r *Reconciler) generateVirtualServicePatches(httpRoutes []VirtualServiceHT
 		}
 		for j := range route.Route {
 			destination := httpRoutes[i].Route[j]
-			host := destination.Destination.Host
+
+			var host string
+			if idx := strings.Index(destination.Destination.Host, "."); idx > 0 {
+				host = destination.Destination.Host[:idx]
+			} else if idx < 0 {
+				host = destination.Destination.Host
+			}
+
 			subset := destination.Destination.Subset
 			weight := destination.Weight
 			if (host != "" && host == canarySvc) || (subset != "" && subset == canarySubset) {
@@ -145,7 +152,10 @@ func (r *Reconciler) reconcileVirtualService(obj *unstructured.Unstructured, des
 	}
 
 	patches := r.generateVirtualServicePatches(httpRoutes, int64(desiredWeight))
-	patches.patchVirtualService(httpRoutesI)
+	err = patches.patchVirtualService(httpRoutesI)
+	if err != nil {
+		return nil, false, err
+	}
 
 	err = unstructured.SetNestedSlice(newObj.Object, httpRoutesI, "spec", "http")
 	return newObj, len(patches) > 0, err
@@ -169,8 +179,7 @@ func (r *Reconciler) UpdateHash(canaryHash, stableHash string) error {
 
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			msg := fmt.Sprintf("DestinationRule `%s` not found", dRuleSpec.Name)
-			r.recorder.Event(r.rollout, corev1.EventTypeWarning, "DestinationRuleNotFound", msg)
+			r.recorder.Warnf(r.rollout, record.EventOptions{EventReason: "DestinationRuleNotFound"}, "DestinationRule `%s` not found", dRuleSpec.Name)
 		}
 		return err
 	}
@@ -209,9 +218,8 @@ func (r *Reconciler) UpdateHash(canaryHash, stableHash string) error {
 		return err
 	}
 	if modified {
-		msg := fmt.Sprintf("DestinationRule %s subset updated (%s: %s, %s: %s)", dRuleSpec.Name, dRuleSpec.CanarySubsetName, canaryHash, dRuleSpec.StableSubsetName, stableHash)
-		r.log.Info(msg)
-		r.recorder.Event(r.rollout, corev1.EventTypeNormal, "UpdatedDestinationRule", msg)
+		r.recorder.Eventf(r.rollout, record.EventOptions{EventReason: "UpdatedDestinationRule"},
+			"DestinationRule %s subset updated (%s: %s, %s: %s)", dRuleSpec.Name, dRuleSpec.CanarySubsetName, canaryHash, dRuleSpec.StableSubsetName, stableHash)
 	}
 	return nil
 }
@@ -312,17 +320,20 @@ func (r *Reconciler) SetWeight(desiredWeight int32) error {
 	ctx := context.TODO()
 	var vsvc *unstructured.Unstructured
 	var err error
-	vsvcName := r.rollout.Spec.Strategy.Canary.TrafficRouting.Istio.VirtualService.Name
-	client := r.client.Resource(istioutil.GetIstioVirtualServiceGVR()).Namespace(r.rollout.Namespace)
+
+	namespace, vsvcName := istioutil.GetVirtualServiceNamespaceName(r.rollout.Spec.Strategy.Canary.TrafficRouting.Istio.VirtualService.Name)
+	if namespace == "" {
+		namespace = r.rollout.Namespace
+	}
+	client := r.client.Resource(istioutil.GetIstioVirtualServiceGVR()).Namespace(namespace)
 	if r.virtualServiceLister != nil {
-		vsvc, err = r.virtualServiceLister.Namespace(r.rollout.Namespace).Get(vsvcName)
+		vsvc, err = r.virtualServiceLister.Namespace(namespace).Get(vsvcName)
 	} else {
 		vsvc, err = client.Get(ctx, vsvcName, metav1.GetOptions{})
 	}
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			msg := fmt.Sprintf("VirtualService `%s` not found", vsvcName)
-			r.recorder.Event(r.rollout, corev1.EventTypeWarning, "VirtualServiceNotFound", msg)
+			r.recorder.Warnf(r.rollout, record.EventOptions{EventReason: "VirtualServiceNotFound"}, "VirtualService `%s` not found", vsvcName)
 		}
 		return err
 	}
@@ -335,9 +346,7 @@ func (r *Reconciler) SetWeight(desiredWeight int32) error {
 	}
 	_, err = client.Update(ctx, modifiedVsvc, metav1.UpdateOptions{})
 	if err == nil {
-		msg := fmt.Sprintf("VirtualService `%s` set to desiredWeight '%d'", vsvcName, desiredWeight)
-		r.log.Info(msg)
-		r.recorder.Event(r.rollout, corev1.EventTypeNormal, "UpdatedVirtualService", msg)
+		r.recorder.Eventf(r.rollout, record.EventOptions{EventReason: "UpdatedVirtualService"}, "VirtualService `%s` set to desiredWeight '%d'", vsvcName, desiredWeight)
 	}
 	return err
 }
@@ -388,10 +397,18 @@ func validateVirtualServiceHTTPRouteDestinations(hr VirtualServiceHTTPRoute, sta
 	hasStableSubset := false
 	hasCanarySubset := false
 	for _, r := range hr.Route {
-		if stableSvc != "" && r.Destination.Host == stableSvc {
+		host := ""
+		if idx := strings.Index(r.Destination.Host, "."); idx > 0 {
+			host = r.Destination.Host[:idx]
+		} else if idx < 0 {
+			host = r.Destination.Host
+		}
+
+		if stableSvc != "" && host == stableSvc {
 			hasStableSvc = true
 		}
-		if canarySvc != "" && r.Destination.Host == canarySvc {
+
+		if canarySvc != "" && host == canarySvc {
 			hasCanarySvc = true
 		}
 		if dRule != nil {
