@@ -136,11 +136,15 @@ spec:
                       autoPromotionSeconds:
                         format: int32
                         type: integer
+                      ingress:
+                        type: string
                       maxUnavailable:
                         anyOf:
                         - type: integer
                         - type: string
                         x-kubernetes-int-or-string: true
+                      mirror:
+                        type: boolean
                       postPromotionAnalysis:
                         properties:
                           args:

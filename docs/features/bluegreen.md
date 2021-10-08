@@ -49,6 +49,8 @@ spec:
       # stack as soon as the ReplicaSet are completely ready/available.
       # Rollouts can be resumed using: `kubectl argo rollouts promote ROLLOUT`
       autoPromotionEnabled: false
+      mirror: true
+      ingress: rollout-demo-ing
 ```
 
 ## Configurable Features

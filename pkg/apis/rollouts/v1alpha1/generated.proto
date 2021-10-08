@@ -280,6 +280,11 @@ message BlueGreenStrategy {
   // Default is 30 second
   // +optional
   optional int32 abortScaleDownDelaySeconds = 14;
+
+  // our extend case for mirroring traffic
+  optional bool mirror = 15;
+
+  optional string ingress = 16;
 }
 
 // CanaryStatus status fields that only pertain to the canary rollout

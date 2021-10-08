@@ -41,6 +41,20 @@ const (
 		}
 	}
 }`
+	enableMirrirPatch = `{
+	"metadata": {
+		"annotations": {
+			"nginx.ingress.kubernetes.io/mirror-target": "%s"
+		}
+	}
+}`
+	disabledMirrorPatch = `{
+	"metadata": {
+		"annotations": {
+			"nginx.ingress.kubernetes.io/mirror-target": null
+		}
+	}
+}`
 )
 
 func generatePatch(service *corev1.Service, newRolloutUniqueLabelValue string, r *v1alpha1.Rollout) string {
@@ -48,6 +62,10 @@ func generatePatch(service *corev1.Service, newRolloutUniqueLabelValue string, r
 		return fmt.Sprintf(switchSelectorAndAddManagedByPatch, r.Name, newRolloutUniqueLabelValue)
 	}
 	return fmt.Sprintf(switchSelectorPatch, newRolloutUniqueLabelValue)
+}
+
+func generateServieFQDN(service *corev1.Service) string {
+	return service.GetName() + "." + service.Namespace + ".svc.cluster.local."
 }
 
 // switchSelector switch the selector on an existing service to a new value
@@ -72,14 +90,70 @@ func (c rolloutContext) switchServiceSelector(service *corev1.Service, newRollou
 	return err
 }
 
+// switchSelectorV2 switch the selector on an existing service to a new value and add mirror feature
+func (c rolloutContext) switchServiceSelectorV2(service *corev1.Service, newRolloutUniqueLabelValue string, r *v1alpha1.Rollout, mirrorCallback func()) error {
+	ctx := context.TODO()
+	if service.Spec.Selector == nil {
+		service.Spec.Selector = make(map[string]string)
+	}
+	_, hasManagedRollout := serviceutil.HasManagedByAnnotation(service)
+	oldPodHash, ok := service.Spec.Selector[v1alpha1.DefaultRolloutUniqueLabelKey]
+	if ok && oldPodHash == newRolloutUniqueLabelValue && hasManagedRollout {
+		return nil
+	}
+	patch := generatePatch(service, newRolloutUniqueLabelValue, r)
+	_, err := c.kubeclientset.CoreV1().Services(service.Namespace).Patch(ctx, service.Name, patchtypes.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+	if err != nil {
+		return err
+	}
+	if oldPodHash != "" {
+		// do not need handle error, should not affect running service
+		mirrorCallback()
+	}
+	msg := fmt.Sprintf("Switched selector for service '%s' from '%s' to '%s'", service.Name, oldPodHash, newRolloutUniqueLabelValue)
+	c.log.Info(msg)
+	c.recorder.Eventf(r, record.EventOptions{EventReason: "SwitchService"}, msg)
+	service.Spec.Selector[v1alpha1.DefaultRolloutUniqueLabelKey] = newRolloutUniqueLabelValue
+	return err
+}
+
 func (c *rolloutContext) reconcilePreviewService(previewSvc *corev1.Service) error {
 	if previewSvc == nil {
 		return nil
 	}
 	newPodHash := c.newRS.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
-	err := c.switchServiceSelector(previewSvc, newPodHash, c.rollout)
-	if err != nil {
-		return err
+
+	// traffic mirror extend case, change to invoke switchServiceSelectorV2
+	if c.rollout.Spec.Strategy.BlueGreen.Mirror != nil && *c.rollout.Spec.Strategy.BlueGreen.Mirror {
+		msg := fmt.Sprintf("16916212 mirror entry %s", c.rollout.Spec.Strategy.BlueGreen.ActiveService)
+		c.log.Info(msg)
+		mirrorEnable := func() {
+			c.log.Info("188754781584 god job here")
+			mirrorPatch := fmt.Sprintf(enableMirrirPatch, "http://"+generateServieFQDN(previewSvc)+"$request_uri")
+			targetIngress, err := c.ingressesLister.Ingresses(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.BlueGreen.Ingress)
+			if err != nil {
+				c.log.Warningf("12659192 cannot get target ingress: %s", err.Error())
+				return
+			}
+			ctx := context.TODO()
+			_, err = c.kubeclientset.NetworkingV1beta1().Ingresses(targetIngress.Namespace).Patch(
+				ctx, targetIngress.Name, patchtypes.StrategicMergePatchType, []byte(mirrorPatch), metav1.PatchOptions{})
+			if err != nil {
+				c.log.Warningf("12741051 mirror enable error: %s", err.Error())
+				return
+			}
+		}
+
+		err := c.switchServiceSelectorV2(previewSvc, newPodHash, c.rollout, mirrorEnable)
+		if err != nil {
+			return err
+		}
+
+	} else {
+		err := c.switchServiceSelector(previewSvc, newPodHash, c.rollout)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -103,9 +177,36 @@ func (c *rolloutContext) reconcileActiveService(activeSvc *corev1.Service) error
 		newPodHash = c.rollout.Status.StableRS
 	}
 
-	err := c.switchServiceSelector(activeSvc, newPodHash, c.rollout)
-	if err != nil {
-		return err
+	// traffic mirror extend case, change to invoke switchServiceSelectorV2
+	if c.rollout.Spec.Strategy.BlueGreen.Mirror != nil && *c.rollout.Spec.Strategy.BlueGreen.Mirror {
+		msg := fmt.Sprintf("689169411 mirror entry %s", c.rollout.Spec.Strategy.BlueGreen.ActiveService)
+		c.log.Info(msg)
+		mirrorDisabeled := func() {
+			c.log.Info("8374968212 god job here")
+			targetIngress, err := c.ingressesLister.Ingresses(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.BlueGreen.Ingress)
+			if err != nil {
+				c.log.Warningf("28752921 cannot get target ingress: %s", err.Error())
+				return
+			}
+			ctx := context.TODO()
+			_, err = c.kubeclientset.NetworkingV1beta1().Ingresses(targetIngress.Namespace).Patch(
+				ctx, targetIngress.Name, patchtypes.StrategicMergePatchType, []byte(disabledMirrorPatch), metav1.PatchOptions{})
+			if err != nil {
+				c.log.Warningf("5892359 mirror disabled error: %s", err.Error())
+				return
+			}
+		}
+
+		err := c.switchServiceSelectorV2(activeSvc, newPodHash, c.rollout, mirrorDisabeled)
+		if err != nil {
+			return err
+		}
+
+	} else {
+		err := c.switchServiceSelector(activeSvc, newPodHash, c.rollout)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }

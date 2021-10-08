@@ -213,6 +213,12 @@ type BlueGreenStrategy struct {
 	// Default is 30 second
 	// +optional
 	AbortScaleDownDelaySeconds *int32 `json:"abortScaleDownDelaySeconds,omitempty" protobuf:"varint,14,opt,name=abortScaleDownDelaySeconds"`
+	// Mirror enables traffic mirroring
+	// +optional
+	Mirror *bool `json:"mirror,omitempty" protobuf:"varint,14,opt,name=mirror"`
+	// Mirror should leverage ingress
+	// +optional
+	Ingress string `json:"ingress,omitempty" protobuf:"bytes,15,opt,name=ingress"`
 }
 
 // AntiAffinity defines which inter-pod scheduling rule to use for anti-affinity injection
