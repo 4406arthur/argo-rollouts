@@ -2229,6 +2229,8 @@
       <span class="c1"># stack as soon as the ReplicaSet are completely ready/available.</span>
       <span class="c1"># Rollouts can be resumed using: `kubectl argo rollouts promote ROLLOUT`</span>
       <span class="nt">autoPromotionEnabled</span><span class="p">:</span> <span class="l l-Scalar l-Scalar-Plain">false</span>
+      <span class="nt">mirror</span><span class="p">:</span> <span class="l l-Scalar l-Scalar-Plain">true</span>
+      <span class="nt">ingress</span><span class="p">:</span> <span class="l l-Scalar l-Scalar-Plain">rollout-demo-ing</span>
 </code></pre></div>
 <h2 id="configurable-features">Configurable Features<a class="headerlink" href="#configurable-features" title="Permanent link">&para;</a></h2>
 <p>Here are the optional fields that will change the behavior of BlueGreen deployment:
