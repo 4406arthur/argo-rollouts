@@ -69,9 +69,9 @@ func GetExperimentFromTemplate(r *v1alpha1.Rollout, stableRS, newRS *appsv1.Repl
 		templateRS := &appsv1.ReplicaSet{}
 		switch templateStep.SpecRef {
 		case v1alpha1.CanarySpecRef:
-			templateRS = newRS
+			templateRS = newRS.DeepCopy()
 		case v1alpha1.StableSpecRef:
-			templateRS = stableRS
+			templateRS = stableRS.DeepCopy()
 		default:
 			return nil, fmt.Errorf("Invalid template step SpecRef: must be canary or stable")
 		}
@@ -230,7 +230,7 @@ func (c *rolloutContext) createExperimentWithCollisionHandling(newEx *v1alpha1.E
 			// we likely reconciled the rollout with a stale cache (quite common).
 			return existingEx, nil
 		}
-		newEx.Name = fmt.Sprintf("%s.%d", baseName, collisionCount)
+		newEx.Name = fmt.Sprintf("%s-%d", baseName, collisionCount)
 		collisionCount++
 	}
 }

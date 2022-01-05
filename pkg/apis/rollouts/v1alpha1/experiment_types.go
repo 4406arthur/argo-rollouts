@@ -16,6 +16,7 @@ const (
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:resource:path=experiments,shortName=exp
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.phase",description="Experiment status"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time since resource was created"
 type Experiment struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
@@ -54,6 +55,11 @@ type ExperimentSpec struct {
 	// more information
 	// +optional
 	ScaleDownDelaySeconds *int32 `json:"scaleDownDelaySeconds,omitempty" protobuf:"varint,6,opt,name=scaleDownDelaySeconds"`
+	// DryRun object contains the settings for running the analysis in Dry-Run mode
+	// +patchMergeKey=metricName
+	// +patchStrategy=merge
+	// +optional
+	DryRun []DryRun `json:"dryRun,omitempty" patchStrategy:"merge" patchMergeKey:"metricName" protobuf:"bytes,7,rep,name=dryRun"`
 }
 
 type TemplateSpec struct {

@@ -24,6 +24,8 @@ import (
 	"github.com/argoproj/argo-rollouts/utils/aws/mocks"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
 	"github.com/argoproj/argo-rollouts/utils/defaults"
+	ingressutil "github.com/argoproj/argo-rollouts/utils/ingress"
+	timeutil "github.com/argoproj/argo-rollouts/utils/time"
 	unstructuredutil "github.com/argoproj/argo-rollouts/utils/unstructured"
 )
 
@@ -494,6 +496,7 @@ func TestCanaryAWSVerifyTargetGroupsNotYetReady(t *testing.T) {
 	f.objects = append(f.objects, r2, tgb)
 	f.kubeobjects = append(f.kubeobjects, rs1, rs2, ing, rootSvc, canarySvc, stableSvc, ep)
 	f.serviceLister = append(f.serviceLister, rootSvc, canarySvc, stableSvc)
+	f.ingressLister = append(f.ingressLister, ingressutil.NewLegacyIngress(ing))
 
 	f.expectGetEndpointsAction(ep)
 	f.run(getKey(r2, t))
@@ -587,6 +590,7 @@ func TestCanaryAWSVerifyTargetGroupsReady(t *testing.T) {
 	f.objects = append(f.objects, r2, tgb)
 	f.kubeobjects = append(f.kubeobjects, rs1, rs2, ing, rootSvc, canarySvc, stableSvc, ep)
 	f.serviceLister = append(f.serviceLister, rootSvc, canarySvc, stableSvc)
+	f.ingressLister = append(f.ingressLister, ingressutil.NewLegacyIngress(ing))
 
 	f.expectGetEndpointsAction(ep)
 	scaleDownRSIndex := f.expectPatchReplicaSetAction(rs1)
@@ -619,7 +623,7 @@ func TestCanaryAWSVerifyTargetGroupsSkip(t *testing.T) {
 
 	rs1 := newReplicaSetWithStatus(r1, 3, 3)
 	// set an annotation on old RS to cause verification to be skipped
-	rs1.Annotations[v1alpha1.DefaultReplicaSetScaleDownDeadlineAnnotationKey] = metav1.Now().Add(600 * time.Second).UTC().Format(time.RFC3339)
+	rs1.Annotations[v1alpha1.DefaultReplicaSetScaleDownDeadlineAnnotationKey] = timeutil.Now().Add(600 * time.Second).UTC().Format(time.RFC3339)
 	rs2 := newReplicaSetWithStatus(r2, 3, 3)
 
 	rs2PodHash := rs2.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
@@ -645,6 +649,7 @@ func TestCanaryAWSVerifyTargetGroupsSkip(t *testing.T) {
 	f.objects = append(f.objects, r2)
 	f.kubeobjects = append(f.kubeobjects, rs1, rs2, ing, rootSvc, canarySvc, stableSvc)
 	f.serviceLister = append(f.serviceLister, rootSvc, canarySvc, stableSvc)
+	f.ingressLister = append(f.ingressLister, ingressutil.NewLegacyIngress(ing))
 
 	f.run(getKey(r2, t)) // there should be no api calls
 	f.assertEvents(nil)

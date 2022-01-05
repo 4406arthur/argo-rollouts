@@ -21,7 +21,7 @@ DEV_IMAGE=false
 # E2E variables
 E2E_INSTANCE_ID ?= argo-rollouts-e2e
 E2E_TEST_OPTIONS ?= 
-E2E_PARALLEL ?= 1
+E2E_PARALLEL ?= 4
 
 override LDFLAGS += \
   -X ${PACKAGE}/utils/version.version=${VERSION} \
@@ -191,6 +191,7 @@ ui/dist:
 plugin-linux: ui/dist
 	cp -r ui/dist/app/* server/static
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -i -ldflags '${LDFLAGS}' -o ${DIST_DIR}/${PLUGIN_CLI_NAME}-linux-amd64 ./cmd/kubectl-argo-rollouts
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -v -i -ldflags '${LDFLAGS}' -o ${DIST_DIR}/${PLUGIN_CLI_NAME}-linux-arm64 ./cmd/kubectl-argo-rollouts
 
 .PHONY: plugin-darwin
 plugin-darwin: ui/dist
@@ -240,11 +241,11 @@ test-kustomize:
 
 .PHONY: start-e2e
 start-e2e:
-	go run ./cmd/rollouts-controller/main.go --instance-id ${E2E_INSTANCE_ID} --loglevel debug
+	go run ./cmd/rollouts-controller/main.go --instance-id ${E2E_INSTANCE_ID} --loglevel debug --kloglevel 6
 
 .PHONY: test-e2e
 test-e2e:
-	go test -timeout 20m -v -count 1 --tags e2e -p ${E2E_PARALLEL} --short ./test/e2e ${E2E_TEST_OPTIONS}
+	go test -timeout 30m -v -count 1 --tags e2e -p ${E2E_PARALLEL} --short ./test/e2e ${E2E_TEST_OPTIONS}
 
 .PHONY: coverage
 coverage: test

@@ -25,6 +25,7 @@ import (
 	"github.com/argoproj/argo-rollouts/utils/conditions"
 	"github.com/argoproj/argo-rollouts/utils/defaults"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
+	timeutil "github.com/argoproj/argo-rollouts/utils/time"
 )
 
 // FindNewReplicaSet returns the new RS this given rollout targets from the given list.
@@ -204,7 +205,7 @@ func IfInjectedAntiAffinityRuleNeedsUpdate(affinity *corev1.Affinity, rollout v1
 }
 
 func NeedsRestart(rollout *v1alpha1.Rollout) bool {
-	now := metav1.Now().UTC()
+	now := timeutil.MetaNow().UTC()
 	if rollout.Spec.RestartAt == nil {
 		return false
 	}
@@ -523,7 +524,7 @@ func PodTemplateEqualIgnoreHash(live, desired *corev1.PodTemplateSpec) bool {
 
 // GetPodTemplateHash returns the rollouts-pod-template-hash value from a ReplicaSet's labels
 func GetPodTemplateHash(rs *appsv1.ReplicaSet) string {
-	if rs.Labels == nil {
+	if rs == nil || rs.Labels == nil {
 		return ""
 	}
 	return rs.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
@@ -594,7 +595,7 @@ func GetTimeRemainingBeforeScaleDownDeadline(rs *appsv1.ReplicaSet) (*time.Durat
 		if err != nil {
 			return nil, fmt.Errorf("unable to read scaleDownAt label on rs '%s'", rs.Name)
 		}
-		now := metav1.Now()
+		now := timeutil.MetaNow()
 		scaleDownAt := metav1.NewTime(scaleDownAtTime)
 		if scaleDownAt.After(now.Time) {
 			remainingTime := scaleDownAt.Sub(now.Time)

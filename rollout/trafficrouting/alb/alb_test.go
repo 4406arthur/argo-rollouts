@@ -27,6 +27,9 @@ import (
 	"github.com/argoproj/argo-rollouts/utils/record"
 )
 
+const STABLE_SVC = "stable-svc"
+const CANARY_SVC = "canary-svc"
+
 func fakeRollout(stableSvc, canarySvc, stableIng string, port int32) *v1alpha1.Rollout {
 	return &v1alpha1.Rollout{
 		ObjectMeta: metav1.ObjectMeta{
@@ -67,15 +70,39 @@ const actionTemplate = `{
 	}
 }`
 
+const actionTemplateWithStickyConfig = `{
+	"Type":"forward",
+	"ForwardConfig":{
+		"TargetGroups":[
+			{
+				"ServiceName":"%s",
+				"ServicePort":"%d",
+				"Weight":%d
+			},{
+				"ServiceName":"%s",
+				"ServicePort":"%d",
+				"Weight":%d
+			}
+		],
+		"TargetGroupStickinessConfig":{
+		  "DurationSeconds" : 300,
+		  "Enabled" : true
+		}
+	}
+}`
+
 const actionTemplateWithExperiments = `{"Type":"forward","ForwardConfig":{"TargetGroups":[{"ServiceName":"%s","ServicePort":"%d","Weight":%d},{"ServiceName":"%s","ServicePort":"%d","Weight":%d},{"ServiceName":"%s","ServicePort":"%d","Weight":%d},{"ServiceName":"%s","ServicePort":"%d","Weight":%d}]}}`
 
 func albActionAnnotation(stable string) string {
 	return fmt.Sprintf("%s%s%s", ingressutil.ALBIngressAnnotation, ingressutil.ALBActionPrefix, stable)
 }
 
-func ingress(name string, stableSvc, canarySvc string, port, weight int32, managedBy string) *extensionsv1beta1.Ingress {
+func ingress(name string, stableSvc, canarySvc string, port, weight int32, managedBy string, includeStickyConfig bool) *extensionsv1beta1.Ingress {
 	managedByValue := fmt.Sprintf("%s:%s", managedBy, albActionAnnotation(stableSvc))
 	action := fmt.Sprintf(actionTemplate, canarySvc, port, weight, stableSvc, port, 100-weight)
+	if includeStickyConfig {
+		action = fmt.Sprintf(actionTemplateWithStickyConfig, canarySvc, port, weight, stableSvc, port, 100-weight)
+	}
 	var a ingressutil.ALBAction
 	err := json.Unmarshal([]byte(action), &a)
 	if err != nil {
@@ -130,12 +157,16 @@ func TestIngressNotFound(t *testing.T) {
 	ro := fakeRollout("stable-service", "canary-service", "stable-ingress", 443)
 	client := fake.NewSimpleClientset()
 	k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
+	ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, err := NewReconciler(ReconcilerConfig{
 		Rollout:        ro,
 		Client:         client,
 		Recorder:       record.NewFakeEventRecorder(),
 		ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
-		IngressLister:  k8sI.Extensions().V1beta1().Ingresses().Lister(),
+		IngressWrapper: ingressWrapper,
 	})
 	assert.NoError(t, err)
 	err = r.SetWeight(10)
@@ -145,16 +176,20 @@ func TestIngressNotFound(t *testing.T) {
 func TestServiceNotFoundInIngress(t *testing.T) {
 	ro := fakeRollout("stable-stable", "canary-service", "ingress", 443)
 	ro.Spec.Strategy.Canary.TrafficRouting.ALB.RootService = "invalid-svc"
-	i := ingress("ingress", "stable-service", "canary-svc", 443, 50, ro.Name)
+	i := ingress("ingress", "stable-service", CANARY_SVC, 443, 50, ro.Name, false)
 	client := fake.NewSimpleClientset()
 	k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
 	k8sI.Extensions().V1beta1().Ingresses().Informer().GetIndexer().Add(i)
+	ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, err := NewReconciler(ReconcilerConfig{
 		Rollout:        ro,
 		Client:         client,
 		Recorder:       record.NewFakeEventRecorder(),
 		ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
-		IngressLister:  k8sI.Extensions().V1beta1().Ingresses().Lister(),
+		IngressWrapper: ingressWrapper,
 	})
 	assert.NoError(t, err)
 	err = r.SetWeight(10)
@@ -162,17 +197,21 @@ func TestServiceNotFoundInIngress(t *testing.T) {
 }
 
 func TestNoChanges(t *testing.T) {
-	ro := fakeRollout("stable-svc", "canary-svc", "ingress", 443)
-	i := ingress("ingress", "stable-svc", "canary-svc", 443, 10, ro.Name)
+	ro := fakeRollout(STABLE_SVC, CANARY_SVC, "ingress", 443)
+	i := ingress("ingress", STABLE_SVC, CANARY_SVC, 443, 10, ro.Name, false)
 	client := fake.NewSimpleClientset()
 	k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
 	k8sI.Extensions().V1beta1().Ingresses().Informer().GetIndexer().Add(i)
+	ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, err := NewReconciler(ReconcilerConfig{
 		Rollout:        ro,
 		Client:         client,
 		Recorder:       record.NewFakeEventRecorder(),
 		ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
-		IngressLister:  k8sI.Extensions().V1beta1().Ingresses().Lister(),
+		IngressWrapper: ingressWrapper,
 	})
 	assert.NoError(t, err)
 	err = r.SetWeight(10)
@@ -181,18 +220,22 @@ func TestNoChanges(t *testing.T) {
 }
 
 func TestErrorOnInvalidManagedBy(t *testing.T) {
-	ro := fakeRollout("stable-svc", "canary-svc", "ingress", 443)
-	i := ingress("ingress", "stable-svc", "canary-svc", 443, 5, ro.Name)
+	ro := fakeRollout(STABLE_SVC, CANARY_SVC, "ingress", 443)
+	i := ingress("ingress", STABLE_SVC, CANARY_SVC, 443, 5, ro.Name, false)
 	i.Annotations[ingressutil.ManagedActionsAnnotation] = "test"
 	client := fake.NewSimpleClientset(i)
 	k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
 	k8sI.Extensions().V1beta1().Ingresses().Informer().GetIndexer().Add(i)
+	ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, err := NewReconciler(ReconcilerConfig{
 		Rollout:        ro,
 		Client:         client,
 		Recorder:       record.NewFakeEventRecorder(),
 		ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
-		IngressLister:  k8sI.Extensions().V1beta1().Ingresses().Lister(),
+		IngressWrapper: ingressWrapper,
 	})
 	assert.NoError(t, err)
 	err = r.SetWeight(10)
@@ -200,18 +243,43 @@ func TestErrorOnInvalidManagedBy(t *testing.T) {
 }
 
 func TestSetInitialDesiredWeight(t *testing.T) {
-	ro := fakeRollout("stable-svc", "canary-svc", "ingress", 443)
-	i := ingress("ingress", "stable-svc", "canary-svc", 443, 5, ro.Name)
+	ro := fakeRollout(STABLE_SVC, CANARY_SVC, "ingress", 443)
+	i := ingress("ingress", STABLE_SVC, CANARY_SVC, 443, 5, ro.Name, false)
 	i.Annotations = map[string]string{}
 	client := fake.NewSimpleClientset(i)
 	k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
 	k8sI.Extensions().V1beta1().Ingresses().Informer().GetIndexer().Add(i)
+	ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, err := NewReconciler(ReconcilerConfig{
 		Rollout:        ro,
 		Client:         client,
 		Recorder:       record.NewFakeEventRecorder(),
 		ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
-		IngressLister:  k8sI.Extensions().V1beta1().Ingresses().Lister(),
+		IngressWrapper: ingressWrapper,
+	})
+	assert.NoError(t, err)
+	err = r.SetWeight(10)
+	assert.Nil(t, err)
+	assert.Len(t, client.Actions(), 1)
+}
+
+func TestUpdateDesiredWeightWithStickyConfig(t *testing.T) {
+	ro := fakeRollout(STABLE_SVC, CANARY_SVC, "ingress", 443)
+	i := ingress("ingress", STABLE_SVC, CANARY_SVC, 443, 5, ro.Name, true)
+	client := fake.NewSimpleClientset(i)
+	k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
+	k8sI.Extensions().V1beta1().Ingresses().Informer().GetIndexer().Add(i)
+	ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+	assert.Nil(t, err)
+	r, err := NewReconciler(ReconcilerConfig{
+		Rollout:        ro,
+		Client:         client,
+		Recorder:       record.NewFakeEventRecorder(),
+		ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
+		IngressWrapper: ingressWrapper,
 	})
 	assert.NoError(t, err)
 	err = r.SetWeight(10)
@@ -220,17 +288,21 @@ func TestSetInitialDesiredWeight(t *testing.T) {
 }
 
 func TestUpdateDesiredWeight(t *testing.T) {
-	ro := fakeRollout("stable-svc", "canary-svc", "ingress", 443)
-	i := ingress("ingress", "stable-svc", "canary-svc", 443, 5, ro.Name)
+	ro := fakeRollout(STABLE_SVC, CANARY_SVC, "ingress", 443)
+	i := ingress("ingress", STABLE_SVC, CANARY_SVC, 443, 5, ro.Name, false)
 	client := fake.NewSimpleClientset(i)
 	k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
 	k8sI.Extensions().V1beta1().Ingresses().Informer().GetIndexer().Add(i)
+	ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, err := NewReconciler(ReconcilerConfig{
 		Rollout:        ro,
 		Client:         client,
 		Recorder:       record.NewFakeEventRecorder(),
 		ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
-		IngressLister:  k8sI.Extensions().V1beta1().Ingresses().Lister(),
+		IngressWrapper: ingressWrapper,
 	})
 	assert.NoError(t, err)
 	err = r.SetWeight(10)
@@ -242,23 +314,72 @@ func TestUpdateDesiredWeight(t *testing.T) {
 // the forward action
 func TestGetForwardActionStringMarshalsZeroCorrectly(t *testing.T) {
 	r := fakeRollout("stable", "canary", "ingress", 443)
-	forwardAction := getForwardActionString(r, 443, 0)
+	forwardAction, err := getForwardActionString(r, 443, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	assert.Contains(t, forwardAction, `"Weight":0`)
 }
 
+func TestGetForwardActionStringMarshalsDisabledStickyConfigCorrectly(t *testing.T) {
+	r := fakeRollout("stable", "canary", "ingress", 443)
+	stickinessConfig := v1alpha1.StickinessConfig{
+		Enabled:         false,
+		DurationSeconds: 0,
+	}
+	r.Spec.Strategy.Canary.TrafficRouting.ALB.StickinessConfig = &stickinessConfig
+	forwardAction, err := getForwardActionString(r, 443, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Contains(t, forwardAction, `"Weight":0`)
+}
+
+func TestGetForwardActionStringDetectsNegativeStickyConfigDuration(t *testing.T) {
+	r := fakeRollout("stable", "canary", "ingress", 443)
+	stickinessConfig := v1alpha1.StickinessConfig{
+		Enabled:         true,
+		DurationSeconds: 0,
+	}
+	r.Spec.Strategy.Canary.TrafficRouting.ALB.StickinessConfig = &stickinessConfig
+	forwardAction, err := getForwardActionString(r, 443, 0)
+
+	assert.NotNilf(t, forwardAction, "There should be no forwardAction being generated: %v", forwardAction)
+	expectedErrorMsg := "TargetGroupStickinessConfig's duration must be between 1 and 604800 seconds (7 days)!"
+	assert.EqualErrorf(t, err, expectedErrorMsg, "Error should be: %v, got: %v", expectedErrorMsg, err)
+}
+
+func TestGetForwardActionStringDetectsTooLargeStickyConfigDuration(t *testing.T) {
+	r := fakeRollout("stable", "canary", "ingress", 443)
+	stickinessConfig := v1alpha1.StickinessConfig{
+		Enabled:         true,
+		DurationSeconds: 604800 + 1,
+	}
+	r.Spec.Strategy.Canary.TrafficRouting.ALB.StickinessConfig = &stickinessConfig
+	forwardAction, err := getForwardActionString(r, 443, 0)
+
+	assert.NotNilf(t, forwardAction, "There should be no forwardAction being generated: %v", forwardAction)
+	expectedErrorMsg := "TargetGroupStickinessConfig's duration must be between 1 and 604800 seconds (7 days)!"
+	assert.EqualErrorf(t, err, expectedErrorMsg, "Error should be: %v, got: %v", expectedErrorMsg, err)
+}
+
 func TestErrorPatching(t *testing.T) {
-	ro := fakeRollout("stable-svc", "canary-svc", "ingress", 443)
-	i := ingress("ingress", "stable-svc", "canary-svc", 443, 5, ro.Name)
+	ro := fakeRollout(STABLE_SVC, CANARY_SVC, "ingress", 443)
+	i := ingress("ingress", STABLE_SVC, CANARY_SVC, 443, 5, ro.Name, false)
 	client := fake.NewSimpleClientset(i)
 	client.ReactionChain = nil
 	k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
 	k8sI.Extensions().V1beta1().Ingresses().Informer().GetIndexer().Add(i)
+	ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, err := NewReconciler(ReconcilerConfig{
 		Rollout:        ro,
 		Client:         client,
 		Recorder:       record.NewFakeEventRecorder(),
 		ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
-		IngressLister:  k8sI.Extensions().V1beta1().Ingresses().Lister(),
+		IngressWrapper: ingressWrapper,
 	})
 	assert.NoError(t, err)
 
@@ -290,10 +411,27 @@ func (f *fakeAWSClient) GetTargetGroupHealth(ctx context.Context, targetGroupARN
 	return f.targetHealthDescriptions, nil
 }
 
+func (f *fakeAWSClient) getAlbStatus() *v1alpha1.ALBStatus {
+	return &v1alpha1.ALBStatus{
+		LoadBalancer: v1alpha1.AwsResourceRef{
+			Name: *f.loadBalancer.LoadBalancerName,
+			ARN:  *f.loadBalancer.LoadBalancerArn,
+		},
+		CanaryTargetGroup: v1alpha1.AwsResourceRef{
+			Name: *f.targetGroups[0].TargetGroupName,
+			ARN:  *f.targetGroups[0].TargetGroupArn,
+		},
+		StableTargetGroup: v1alpha1.AwsResourceRef{
+			Name: *f.targetGroups[len(f.targetGroups)-1].TargetGroupName,
+			ARN:  *f.targetGroups[len(f.targetGroups)-1].TargetGroupArn,
+		},
+	}
+}
+
 func TestVerifyWeight(t *testing.T) {
-	newFakeReconciler := func() (*Reconciler, *fakeAWSClient) {
-		ro := fakeRollout("stable-svc", "canary-svc", "ingress", 443)
-		i := ingress("ingress", "stable-svc", "canary-svc", 443, 5, ro.Name)
+	newFakeReconciler := func(status *v1alpha1.RolloutStatus) (*Reconciler, *fakeAWSClient) {
+		ro := fakeRollout(STABLE_SVC, CANARY_SVC, "ingress", 443)
+		i := ingress("ingress", STABLE_SVC, CANARY_SVC, 443, 5, ro.Name, false)
 		i.Status.LoadBalancer = corev1.LoadBalancerStatus{
 			Ingress: []corev1.LoadBalancerIngress{
 				{
@@ -305,13 +443,18 @@ func TestVerifyWeight(t *testing.T) {
 		client := fake.NewSimpleClientset(i)
 		k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
 		k8sI.Extensions().V1beta1().Ingresses().Informer().GetIndexer().Add(i)
+		ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+		if err != nil {
+			t.Fatal(err)
+		}
 		r, err := NewReconciler(ReconcilerConfig{
 			Rollout:        ro,
 			Client:         client,
 			Recorder:       record.NewFakeEventRecorder(),
 			ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
-			IngressLister:  k8sI.Extensions().V1beta1().Ingresses().Lister(),
+			IngressWrapper: ingressWrapper,
 			VerifyWeight:   pointer.BoolPtr(true),
+			Status:         status,
 		})
 		assert.NoError(t, err)
 		fakeAWS := fakeAWSClient{}
@@ -321,7 +464,7 @@ func TestVerifyWeight(t *testing.T) {
 
 	// LoadBalancer not found
 	{
-		r, _ := newFakeReconciler()
+		r, _ := newFakeReconciler(nil)
 		weightVerified, err := r.VerifyWeight(10)
 		assert.NoError(t, err)
 		assert.False(t, *weightVerified)
@@ -329,19 +472,32 @@ func TestVerifyWeight(t *testing.T) {
 
 	// LoadBalancer found, not at weight
 	{
-		r, fakeClient := newFakeReconciler()
+		var status v1alpha1.RolloutStatus
+		r, fakeClient := newFakeReconciler(&status)
 		fakeClient.loadBalancer = &elbv2types.LoadBalancer{
-			LoadBalancerArn: pointer.StringPtr("lb-abc123"),
-			DNSName:         pointer.StringPtr("verify-weight-test-abc-123.us-west-2.elb.amazonaws.com"),
+			LoadBalancerName: pointer.StringPtr("lb-abc123-name"),
+			LoadBalancerArn:  pointer.StringPtr("lb-abc123-arn"),
+			DNSName:          pointer.StringPtr("verify-weight-test-abc-123.us-west-2.elb.amazonaws.com"),
 		}
 		fakeClient.targetGroups = []aws.TargetGroupMeta{
 			{
 				TargetGroup: elbv2types.TargetGroup{
-					TargetGroupArn: pointer.StringPtr("tg-abc123"),
+					TargetGroupName: pointer.StringPtr("canary-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("canary-tg-abc123-arn"),
 				},
 				Weight: pointer.Int32Ptr(11),
 				Tags: map[string]string{
 					aws.AWSLoadBalancerV2TagKeyResourceID: "default/ingress-canary-svc:443",
+				},
+			},
+			{
+				TargetGroup: elbv2types.TargetGroup{
+					TargetGroupName: pointer.StringPtr("stable-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("stable-tg-abc123-arn"),
+				},
+				Weight: pointer.Int32Ptr(89),
+				Tags: map[string]string{
+					aws.AWSLoadBalancerV2TagKeyResourceID: "default/ingress-stable-svc:443",
 				},
 			},
 		}
@@ -349,23 +505,37 @@ func TestVerifyWeight(t *testing.T) {
 		weightVerified, err := r.VerifyWeight(10)
 		assert.NoError(t, err)
 		assert.False(t, *weightVerified)
+		assert.Equal(t, status.ALB, *fakeClient.getAlbStatus())
 	}
 
 	// LoadBalancer found, at weight
 	{
-		r, fakeClient := newFakeReconciler()
+		var status v1alpha1.RolloutStatus
+		r, fakeClient := newFakeReconciler(&status)
 		fakeClient.loadBalancer = &elbv2types.LoadBalancer{
-			LoadBalancerArn: pointer.StringPtr("lb-abc123"),
-			DNSName:         pointer.StringPtr("verify-weight-test-abc-123.us-west-2.elb.amazonaws.com"),
+			LoadBalancerName: pointer.StringPtr("lb-abc123-name"),
+			LoadBalancerArn:  pointer.StringPtr("lb-abc123-arn"),
+			DNSName:          pointer.StringPtr("verify-weight-test-abc-123.us-west-2.elb.amazonaws.com"),
 		}
 		fakeClient.targetGroups = []aws.TargetGroupMeta{
 			{
 				TargetGroup: elbv2types.TargetGroup{
-					TargetGroupArn: pointer.StringPtr("tg-abc123"),
+					TargetGroupName: pointer.StringPtr("canary-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("canary-tg-abc123-arn"),
 				},
 				Weight: pointer.Int32Ptr(10),
 				Tags: map[string]string{
 					aws.AWSLoadBalancerV2TagKeyResourceID: "default/ingress-canary-svc:443",
+				},
+			},
+			{
+				TargetGroup: elbv2types.TargetGroup{
+					TargetGroupName: pointer.StringPtr("stable-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("stable-tg-abc123-arn"),
+				},
+				Weight: pointer.Int32Ptr(11),
+				Tags: map[string]string{
+					aws.AWSLoadBalancerV2TagKeyResourceID: "default/ingress-stable-svc:443",
 				},
 			},
 		}
@@ -373,21 +543,26 @@ func TestVerifyWeight(t *testing.T) {
 		weightVerified, err := r.VerifyWeight(10)
 		assert.NoError(t, err)
 		assert.True(t, *weightVerified)
+		assert.Equal(t, status.ALB, *fakeClient.getAlbStatus())
 	}
 }
 
 func TestSetWeightWithMultipleBackends(t *testing.T) {
-	ro := fakeRollout("stable-svc", "canary-svc", "ingress", 443)
-	i := ingress("ingress", "stable-svc", "canary-svc", 443, 0, ro.Name)
+	ro := fakeRollout(STABLE_SVC, CANARY_SVC, "ingress", 443)
+	i := ingress("ingress", STABLE_SVC, CANARY_SVC, 443, 0, ro.Name, false)
 	client := fake.NewSimpleClientset(i)
 	k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
 	k8sI.Extensions().V1beta1().Ingresses().Informer().GetIndexer().Add(i)
+	ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, err := NewReconciler(ReconcilerConfig{
 		Rollout:        ro,
 		Client:         client,
 		Recorder:       record.NewFakeEventRecorder(),
 		ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
-		IngressLister:  k8sI.Extensions().V1beta1().Ingresses().Lister(),
+		IngressWrapper: ingressWrapper,
 	})
 	assert.NoError(t, err)
 
@@ -415,9 +590,8 @@ func TestSetWeightWithMultipleBackends(t *testing.T) {
 	assert.Nil(t, err)
 
 	servicePort := 443
-	expectedAction := fmt.Sprintf(actionTemplateWithExperiments, "canary-svc", servicePort, 10, weightDestinations[0].ServiceName, servicePort, weightDestinations[0].Weight, weightDestinations[1].ServiceName, servicePort, weightDestinations[1].Weight, "stable-svc", servicePort, 85)
+	expectedAction := fmt.Sprintf(actionTemplateWithExperiments, CANARY_SVC, servicePort, 10, weightDestinations[0].ServiceName, servicePort, weightDestinations[0].Weight, weightDestinations[1].ServiceName, servicePort, weightDestinations[1].Weight, STABLE_SVC, servicePort, 85)
 	assert.Equal(t, expectedAction, patchedI.Annotations["alb.ingress.kubernetes.io/actions.stable-svc"])
-
 }
 
 func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
@@ -433,10 +607,10 @@ func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
 			Weight:          3,
 		},
 	}
-	newFakeReconciler := func() (*Reconciler, *fakeAWSClient) {
-		ro := fakeRollout("stable-svc", "canary-svc", "ingress", 443)
-		i := ingress("ingress", "stable-svc", "canary-svc", 443, 0, ro.Name)
-		i.Annotations["alb.ingress.kubernetes.io/actions.stable-svc"] = fmt.Sprintf(actionTemplateWithExperiments, "canary-svc", 443, 10, weightDestinations[0].ServiceName, 443, weightDestinations[0].Weight, weightDestinations[1].ServiceName, 443, weightDestinations[1].Weight, "stable-svc", 443, 85)
+	newFakeReconciler := func(status *v1alpha1.RolloutStatus) (*Reconciler, *fakeAWSClient) {
+		ro := fakeRollout(STABLE_SVC, CANARY_SVC, "ingress", 443)
+		i := ingress("ingress", STABLE_SVC, CANARY_SVC, 443, 0, ro.Name, false)
+		i.Annotations["alb.ingress.kubernetes.io/actions.stable-svc"] = fmt.Sprintf(actionTemplateWithExperiments, CANARY_SVC, 443, 10, weightDestinations[0].ServiceName, 443, weightDestinations[0].Weight, weightDestinations[1].ServiceName, 443, weightDestinations[1].Weight, STABLE_SVC, 443, 85)
 
 		i.Status.LoadBalancer = corev1.LoadBalancerStatus{
 			Ingress: []corev1.LoadBalancerIngress{
@@ -449,13 +623,18 @@ func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
 		client := fake.NewSimpleClientset(i)
 		k8sI := kubeinformers.NewSharedInformerFactory(client, 0)
 		k8sI.Extensions().V1beta1().Ingresses().Informer().GetIndexer().Add(i)
+		ingressWrapper, err := ingressutil.NewIngressWrapper(ingressutil.IngressModeExtensions, client, k8sI)
+		if err != nil {
+			t.Fatal(err)
+		}
 		r, err := NewReconciler(ReconcilerConfig{
 			Rollout:        ro,
 			Client:         client,
 			Recorder:       record.NewFakeEventRecorder(),
 			ControllerKind: schema.GroupVersionKind{Group: "foo", Version: "v1", Kind: "Bar"},
-			IngressLister:  k8sI.Extensions().V1beta1().Ingresses().Lister(),
+			IngressWrapper: ingressWrapper,
 			VerifyWeight:   pointer.BoolPtr(true),
+			Status:         status,
 		})
 		assert.NoError(t, err)
 		fakeAWS := fakeAWSClient{}
@@ -465,19 +644,32 @@ func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
 
 	// LoadBalancer found, but experiment weights not present
 	{
-		r, fakeClient := newFakeReconciler()
+		var status v1alpha1.RolloutStatus
+		r, fakeClient := newFakeReconciler(&status)
 		fakeClient.loadBalancer = &elbv2types.LoadBalancer{
-			LoadBalancerArn: pointer.StringPtr("lb-abc123"),
-			DNSName:         pointer.StringPtr("verify-weight-test-abc-123.us-west-2.elb.amazonaws.com"),
+			LoadBalancerName: pointer.StringPtr("lb-abc123-name"),
+			LoadBalancerArn:  pointer.StringPtr("lb-abc123-arn"),
+			DNSName:          pointer.StringPtr("verify-weight-test-abc-123.us-west-2.elb.amazonaws.com"),
 		}
 		fakeClient.targetGroups = []aws.TargetGroupMeta{
 			{
 				TargetGroup: elbv2types.TargetGroup{
-					TargetGroupArn: pointer.StringPtr("tg-abc123"),
+					TargetGroupName: pointer.StringPtr("canary-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("canary-tg-abc123-arn"),
 				},
 				Weight: pointer.Int32Ptr(10),
 				Tags: map[string]string{
 					aws.AWSLoadBalancerV2TagKeyResourceID: "default/ingress-canary-svc:443",
+				},
+			},
+			{
+				TargetGroup: elbv2types.TargetGroup{
+					TargetGroupName: pointer.StringPtr("stable-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("stable-tg-abc123-arn"),
+				},
+				Weight: pointer.Int32Ptr(90),
+				Tags: map[string]string{
+					aws.AWSLoadBalancerV2TagKeyResourceID: "default/ingress-stable-svc:443",
 				},
 			},
 		}
@@ -485,19 +677,23 @@ func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
 		weightVerified, err := r.VerifyWeight(10, weightDestinations...)
 		assert.NoError(t, err)
 		assert.False(t, *weightVerified)
+		assert.Equal(t, status.ALB, *fakeClient.getAlbStatus())
 	}
 
 	// LoadBalancer found, with incorrect weights
 	{
-		r, fakeClient := newFakeReconciler()
+		var status v1alpha1.RolloutStatus
+		r, fakeClient := newFakeReconciler(&status)
 		fakeClient.loadBalancer = &elbv2types.LoadBalancer{
-			LoadBalancerArn: pointer.StringPtr("lb-abc123"),
-			DNSName:         pointer.StringPtr("verify-weight-test-abc-123.us-west-2.elb.amazonaws.com"),
+			LoadBalancerName: pointer.StringPtr("lb-abc123-name"),
+			LoadBalancerArn:  pointer.StringPtr("lb-abc123-arn"),
+			DNSName:          pointer.StringPtr("verify-weight-test-abc-123.us-west-2.elb.amazonaws.com"),
 		}
 		fakeClient.targetGroups = []aws.TargetGroupMeta{
 			{
 				TargetGroup: elbv2types.TargetGroup{
-					TargetGroupArn: pointer.StringPtr("tg-abc123"),
+					TargetGroupName: pointer.StringPtr("canary-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("canary-tg-abc123-arn"),
 				},
 				Weight: pointer.Int32Ptr(10),
 				Tags: map[string]string{
@@ -506,7 +702,8 @@ func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
 			},
 			{
 				TargetGroup: elbv2types.TargetGroup{
-					TargetGroupArn: pointer.StringPtr("tg-abc123"),
+					TargetGroupName: pointer.StringPtr("ex-svc-1-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("ex-svc-1-tg-abc123-arn"),
 				},
 				Weight: pointer.Int32Ptr(100),
 				Tags: map[string]string{
@@ -515,11 +712,22 @@ func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
 			},
 			{
 				TargetGroup: elbv2types.TargetGroup{
-					TargetGroupArn: pointer.StringPtr("tg-abc123"),
+					TargetGroupName: pointer.StringPtr("ex-svc-2-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("ex-svc-2-tg-abc123-arn"),
 				},
 				Weight: pointer.Int32Ptr(100),
 				Tags: map[string]string{
 					aws.AWSLoadBalancerV2TagKeyResourceID: "default/ingress-ex-svc-2:443",
+				},
+			},
+			{
+				TargetGroup: elbv2types.TargetGroup{
+					TargetGroupName: pointer.StringPtr("stable-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("stable-tg-abc123-arn"),
+				},
+				Weight: pointer.Int32Ptr(85),
+				Tags: map[string]string{
+					aws.AWSLoadBalancerV2TagKeyResourceID: "default/ingress-stable-svc:443",
 				},
 			},
 		}
@@ -527,19 +735,23 @@ func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
 		weightVerified, err := r.VerifyWeight(10, weightDestinations...)
 		assert.NoError(t, err)
 		assert.False(t, *weightVerified)
+		assert.Equal(t, status.ALB, *fakeClient.getAlbStatus())
 	}
 
 	// LoadBalancer found, with all correct weights
 	{
-		r, fakeClient := newFakeReconciler()
+		var status v1alpha1.RolloutStatus
+		r, fakeClient := newFakeReconciler(&status)
 		fakeClient.loadBalancer = &elbv2types.LoadBalancer{
-			LoadBalancerArn: pointer.StringPtr("lb-abc123"),
-			DNSName:         pointer.StringPtr("verify-weight-test-abc-123.us-west-2.elb.amazonaws.com"),
+			LoadBalancerName: pointer.StringPtr("lb-abc123-name"),
+			LoadBalancerArn:  pointer.StringPtr("lb-abc123-arn"),
+			DNSName:          pointer.StringPtr("verify-weight-test-abc-123.us-west-2.elb.amazonaws.com"),
 		}
 		fakeClient.targetGroups = []aws.TargetGroupMeta{
 			{
 				TargetGroup: elbv2types.TargetGroup{
-					TargetGroupArn: pointer.StringPtr("tg-abc123"),
+					TargetGroupName: pointer.StringPtr("canary-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("canary-tg-abc123-arn"),
 				},
 				Weight: pointer.Int32Ptr(10),
 				Tags: map[string]string{
@@ -548,7 +760,8 @@ func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
 			},
 			{
 				TargetGroup: elbv2types.TargetGroup{
-					TargetGroupArn: pointer.StringPtr("tg-abc123"),
+					TargetGroupName: pointer.StringPtr("ex-svc-1-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("ex-svc-1-tg-abc123-arn"),
 				},
 				Weight: &weightDestinations[0].Weight,
 				Tags: map[string]string{
@@ -557,11 +770,22 @@ func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
 			},
 			{
 				TargetGroup: elbv2types.TargetGroup{
-					TargetGroupArn: pointer.StringPtr("tg-abc123"),
+					TargetGroupName: pointer.StringPtr("ex-svc-2-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("ex-svc-2-tg-abc123-arn"),
 				},
 				Weight: &weightDestinations[1].Weight,
 				Tags: map[string]string{
 					aws.AWSLoadBalancerV2TagKeyResourceID: "default/ingress-ex-svc-2:443",
+				},
+			},
+			{
+				TargetGroup: elbv2types.TargetGroup{
+					TargetGroupName: pointer.StringPtr("stable-tg-abc123-name"),
+					TargetGroupArn:  pointer.StringPtr("stable-tg-abc123-arn"),
+				},
+				Weight: pointer.Int32Ptr(85),
+				Tags: map[string]string{
+					aws.AWSLoadBalancerV2TagKeyResourceID: "default/ingress-stable-svc:443",
 				},
 			},
 		}
@@ -569,5 +793,6 @@ func TestVerifyWeightWithAdditionalDestinations(t *testing.T) {
 		weightVerified, err := r.VerifyWeight(10, weightDestinations...)
 		assert.NoError(t, err)
 		assert.True(t, *weightVerified)
+		assert.Equal(t, status.ALB, *fakeClient.getAlbStatus())
 	}
 }

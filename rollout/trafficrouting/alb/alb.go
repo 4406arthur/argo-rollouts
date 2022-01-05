@@ -6,19 +6,16 @@ import (
 	"strconv"
 
 	"github.com/sirupsen/logrus"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	extensionslisters "k8s.io/client-go/listers/extensions/v1beta1"
 	"k8s.io/utils/pointer"
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/utils/aws"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
 	"github.com/argoproj/argo-rollouts/utils/defaults"
-	"github.com/argoproj/argo-rollouts/utils/diff"
 	ingressutil "github.com/argoproj/argo-rollouts/utils/ingress"
 	jsonutil "github.com/argoproj/argo-rollouts/utils/json"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
@@ -36,8 +33,14 @@ type ReconcilerConfig struct {
 	Client         kubernetes.Interface
 	Recorder       record.EventRecorder
 	ControllerKind schema.GroupVersionKind
-	IngressLister  extensionslisters.IngressLister
+	IngressWrapper IngressWrapper
+	Status         *v1alpha1.RolloutStatus
 	VerifyWeight   *bool
+}
+
+type IngressWrapper interface {
+	GetCached(namespace, name string) (*ingressutil.Ingress, error)
+	Patch(ctx context.Context, namespace, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (*ingressutil.Ingress, error)
 }
 
 // Reconciler holds required fields to reconcile ALB Ingress resources
@@ -71,24 +74,25 @@ func (r *Reconciler) SetWeight(desiredWeight int32, additionalDestinations ...v1
 	ctx := context.TODO()
 	rollout := r.cfg.Rollout
 	ingressName := rollout.Spec.Strategy.Canary.TrafficRouting.ALB.Ingress
-	ingress, err := r.cfg.IngressLister.Ingresses(rollout.Namespace).Get(ingressName)
+	ingress, err := r.cfg.IngressWrapper.GetCached(rollout.Namespace, ingressName)
 	if err != nil {
 		return err
 	}
-	actionService := r.cfg.Rollout.Spec.Strategy.Canary.StableService
-	if r.cfg.Rollout.Spec.Strategy.Canary.TrafficRouting.ALB.RootService != "" {
-		actionService = r.cfg.Rollout.Spec.Strategy.Canary.TrafficRouting.ALB.RootService
+	actionService := rollout.Spec.Strategy.Canary.StableService
+	if rollout.Spec.Strategy.Canary.TrafficRouting.ALB.RootService != "" {
+		actionService = rollout.Spec.Strategy.Canary.TrafficRouting.ALB.RootService
 	}
-	port := r.cfg.Rollout.Spec.Strategy.Canary.TrafficRouting.ALB.ServicePort
+	port := rollout.Spec.Strategy.Canary.TrafficRouting.ALB.ServicePort
 	if !ingressutil.HasRuleWithService(ingress, actionService) {
 		return fmt.Errorf("ingress does not have service `%s` in rules", actionService)
 	}
 
-	desired, err := getDesiredAnnotations(ingress, rollout, port, desiredWeight, additionalDestinations...)
+	desiredAnnotations, err := getDesiredAnnotations(ingress, rollout, port, desiredWeight, additionalDestinations...)
 	if err != nil {
 		return err
 	}
-	patch, modified, err := calculatePatch(ingress, desired)
+	desiredIngress := ingressutil.NewIngressWithAnnotations(ingress.Mode(), desiredAnnotations)
+	patch, modified, err := ingressutil.BuildIngressPatch(ingress.Mode(), ingress, desiredIngress, ingressutil.WithAnnotations())
 	if err != nil {
 		return nil
 	}
@@ -98,8 +102,9 @@ func (r *Reconciler) SetWeight(desiredWeight int32, additionalDestinations ...v1
 	}
 	r.log.WithField("patch", string(patch)).Debug("applying ALB Ingress patch")
 	r.log.WithField("desiredWeight", desiredWeight).Info("updating ALB Ingress")
-	r.cfg.Recorder.Eventf(r.cfg.Rollout, record.EventOptions{EventReason: "PatchingALBIngress"}, "Updating Ingress `%s` to desiredWeight '%d'", ingressName, desiredWeight)
-	_, err = r.cfg.Client.ExtensionsV1beta1().Ingresses(ingress.Namespace).Patch(ctx, ingress.Name, types.MergePatchType, patch, metav1.PatchOptions{})
+	r.cfg.Recorder.Eventf(rollout, record.EventOptions{EventReason: "PatchingALBIngress"}, "Updating Ingress `%s` to desiredWeight '%d'", ingressName, desiredWeight)
+
+	_, err = r.cfg.IngressWrapper.Patch(ctx, ingress.GetNamespace(), ingress.GetName(), types.MergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {
 		r.log.WithField("err", err.Error()).Error("error patching alb ingress")
 		return fmt.Errorf("error patching alb ingress `%s`: %v", ingressName, err)
@@ -121,26 +126,29 @@ func (r *Reconciler) VerifyWeight(desiredWeight int32, additionalDestinations ..
 	ctx := context.TODO()
 	rollout := r.cfg.Rollout
 	ingressName := rollout.Spec.Strategy.Canary.TrafficRouting.ALB.Ingress
-	ingress, err := r.cfg.IngressLister.Ingresses(rollout.Namespace).Get(ingressName)
+	ingress, err := r.cfg.IngressWrapper.GetCached(rollout.Namespace, ingressName)
 	if err != nil {
 		return pointer.BoolPtr(false), err
 	}
 	resourceIDToDest := map[string]v1alpha1.WeightDestination{}
 
 	canaryService := rollout.Spec.Strategy.Canary.CanaryService
-	canaryResourceID := aws.BuildTargetGroupResourceID(rollout.Namespace, ingress.Name, canaryService, rollout.Spec.Strategy.Canary.TrafficRouting.ALB.ServicePort)
+	canaryResourceID := aws.BuildTargetGroupResourceID(rollout.Namespace, ingress.GetName(), canaryService, rollout.Spec.Strategy.Canary.TrafficRouting.ALB.ServicePort)
+	stableService := rollout.Spec.Strategy.Canary.StableService
+	stableResourceID := aws.BuildTargetGroupResourceID(rollout.Namespace, ingress.GetName(), stableService, rollout.Spec.Strategy.Canary.TrafficRouting.ALB.ServicePort)
 
 	for _, dest := range additionalDestinations {
-		resourceID := aws.BuildTargetGroupResourceID(rollout.Namespace, ingress.Name, dest.ServiceName, rollout.Spec.Strategy.Canary.TrafficRouting.ALB.ServicePort)
+		resourceID := aws.BuildTargetGroupResourceID(rollout.Namespace, ingress.GetName(), dest.ServiceName, rollout.Spec.Strategy.Canary.TrafficRouting.ALB.ServicePort)
 		resourceIDToDest[resourceID] = dest
 	}
 
-	if len(ingress.Status.LoadBalancer.Ingress) == 0 {
+	loadBalancerStatus := ingress.GetLoadBalancerStatus()
+	if len(loadBalancerStatus.Ingress) == 0 {
 		r.log.Infof("LoadBalancer not yet allocated")
 	}
 
 	numVerifiedWeights := 0
-	for _, lbIngress := range ingress.Status.LoadBalancer.Ingress {
+	for _, lbIngress := range loadBalancerStatus.Ingress {
 		if lbIngress.Hostname == "" {
 			continue
 		}
@@ -153,6 +161,10 @@ func (r *Reconciler) VerifyWeight(desiredWeight int32, additionalDestinations ..
 			r.log.Infof("LoadBalancer %s not found", lbIngress.Hostname)
 			return pointer.BoolPtr(false), nil
 		}
+
+		r.cfg.Status.ALB.LoadBalancer.Name = *lb.LoadBalancerName
+		r.cfg.Status.ALB.LoadBalancer.ARN = *lb.LoadBalancerArn
+
 		lbTargetGroups, err := r.aws.GetTargetGroupMetadata(ctx, *lb.LoadBalancerArn)
 		if err != nil {
 			r.cfg.Recorder.Warnf(rollout, record.EventOptions{EventReason: conditions.TargetGroupVerifyErrorReason}, conditions.TargetGroupVerifyErrorMessage, canaryService, "unknown", err.Error())
@@ -161,6 +173,8 @@ func (r *Reconciler) VerifyWeight(desiredWeight int32, additionalDestinations ..
 		logCtx := r.log.WithField("lb", *lb.LoadBalancerArn)
 		for _, tg := range lbTargetGroups {
 			if tg.Tags[aws.AWSLoadBalancerV2TagKeyResourceID] == canaryResourceID {
+				r.cfg.Status.ALB.CanaryTargetGroup.Name = *tg.TargetGroupName
+				r.cfg.Status.ALB.CanaryTargetGroup.ARN = *tg.TargetGroupArn
 				if tg.Weight != nil {
 					logCtx := logCtx.WithField("tg", *tg.TargetGroupArn)
 					logCtx.Infof("canary weight of %s (desired: %d, current: %d)", canaryResourceID, desiredWeight, *tg.Weight)
@@ -184,28 +198,16 @@ func (r *Reconciler) VerifyWeight(desiredWeight int32, additionalDestinations ..
 						r.cfg.Recorder.Warnf(rollout, record.EventOptions{EventReason: conditions.TargetGroupUnverifiedReason}, conditions.TargetGroupUnverifiedWeightsMessage, dest.ServiceName, *tg.TargetGroupArn, dest.Weight, *tg.Weight)
 					}
 				}
+			} else if tg.Tags[aws.AWSLoadBalancerV2TagKeyResourceID] == stableResourceID {
+				r.cfg.Status.ALB.StableTargetGroup.Name = *tg.TargetGroupName
+				r.cfg.Status.ALB.StableTargetGroup.ARN = *tg.TargetGroupArn
 			}
 		}
 	}
 	return pointer.BoolPtr(numVerifiedWeights == 1+len(additionalDestinations)), nil
 }
 
-func calculatePatch(current *extensionsv1beta1.Ingress, desiredAnnotations map[string]string) ([]byte, bool, error) {
-	// only compare Annotations
-	return diff.CreateTwoWayMergePatch(
-		&extensionsv1beta1.Ingress{
-			ObjectMeta: metav1.ObjectMeta{
-				Annotations: current.Annotations,
-			},
-		},
-		&extensionsv1beta1.Ingress{
-			ObjectMeta: metav1.ObjectMeta{
-				Annotations: desiredAnnotations,
-			},
-		}, extensionsv1beta1.Ingress{})
-}
-
-func getForwardActionString(r *v1alpha1.Rollout, port int32, desiredWeight int32, additionalDestinations ...v1alpha1.WeightDestination) string {
+func getForwardActionString(r *v1alpha1.Rollout, port int32, desiredWeight int32, additionalDestinations ...v1alpha1.WeightDestination) (string, error) {
 	stableService := r.Spec.Strategy.Canary.StableService
 	canaryService := r.Spec.Strategy.Canary.CanaryService
 	portStr := strconv.Itoa(int(port))
@@ -243,14 +245,33 @@ func getForwardActionString(r *v1alpha1.Rollout, port int32, desiredWeight int32
 			TargetGroups: targetGroups,
 		},
 	}
+
+	var stickinessConfig = r.Spec.Strategy.Canary.TrafficRouting.ALB.StickinessConfig
+	if stickinessConfig != nil && stickinessConfig.Enabled {
+		// AWS API valid range
+		// https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/API_TargetGroupStickinessConfig.html
+		if stickinessConfig.DurationSeconds < 1 || stickinessConfig.DurationSeconds > 604800 {
+			return "", fmt.Errorf("TargetGroupStickinessConfig's duration must be between 1 and 604800 seconds (7 days)!")
+		}
+		newStickyConfig := ingressutil.ALBTargetGroupStickinessConfig{
+			Enabled:         true,
+			DurationSeconds: stickinessConfig.DurationSeconds,
+		}
+		action.ForwardConfig.TargetGroupStickinessConfig = &newStickyConfig
+	}
+
 	bytes := jsonutil.MustMarshal(action)
-	return string(bytes)
+	return string(bytes), nil
 }
 
-func getDesiredAnnotations(current *extensionsv1beta1.Ingress, r *v1alpha1.Rollout, port int32, desiredWeight int32, additionalDestinations ...v1alpha1.WeightDestination) (map[string]string, error) {
-	desired := current.DeepCopy().Annotations
+func getDesiredAnnotations(current *ingressutil.Ingress, r *v1alpha1.Rollout, port int32, desiredWeight int32, additionalDestinations ...v1alpha1.WeightDestination) (map[string]string, error) {
+	desired := current.DeepCopy().GetAnnotations()
 	key := ingressutil.ALBActionAnnotationKey(r)
-	desired[key] = getForwardActionString(r, port, desiredWeight, additionalDestinations...)
+	value, err := getForwardActionString(r, port, desiredWeight, additionalDestinations...)
+	if err != nil {
+		return nil, err
+	}
+	desired[key] = value
 	m, err := ingressutil.NewManagedALBActions(desired[ingressutil.ManagedActionsAnnotation])
 	if err != nil {
 		return nil, err
@@ -261,6 +282,6 @@ func getDesiredAnnotations(current *extensionsv1beta1.Ingress, r *v1alpha1.Rollo
 }
 
 // UpdateHash informs a traffic routing reconciler about new canary/stable pod hashes
-func (r *Reconciler) UpdateHash(canaryHash, stableHash string) error {
+func (r *Reconciler) UpdateHash(canaryHash, stableHash string, additionalDestinations ...v1alpha1.WeightDestination) error {
 	return nil
 }

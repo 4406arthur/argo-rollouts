@@ -20,6 +20,7 @@ import (
 // +kubebuilder:printcolumn:name="Current",type="integer",JSONPath=".status.replicas",description="Total number of non-terminated pods targeted by this rollout"
 // +kubebuilder:printcolumn:name="Up-to-date",type="integer",JSONPath=".status.updatedReplicas",description="Total number of non-terminated pods targeted by this rollout that have the desired template spec"
 // +kubebuilder:printcolumn:name="Available",type="integer",JSONPath=".status.availableReplicas",description="Total number of available pods (ready for at least minReadySeconds) targeted by this rollout"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time since resource was created"
 // +kubebuilder:subresource:status
 
 // Rollout is a specification for a Rollout resource
@@ -329,9 +330,17 @@ type ALBTrafficRouting struct {
 	ServicePort int32 `json:"servicePort" protobuf:"varint,2,opt,name=servicePort"`
 	// RootService references the service in the ingress to the controller should add the action to
 	RootService string `json:"rootService,omitempty" protobuf:"bytes,3,opt,name=rootService"`
+	// AdditionalForwardConfig allows to specify further settings on the ForwaredConfig
+	// +optional
+	StickinessConfig *StickinessConfig `json:"stickinessConfig,omitempty" protobuf:"bytes,5,opt,name=stickinessConfig"`
 	// AnnotationPrefix has to match the configured annotation prefix on the alb ingress controller
 	// +optional
 	AnnotationPrefix string `json:"annotationPrefix,omitempty" protobuf:"bytes,4,opt,name=annotationPrefix"`
+}
+
+type StickinessConfig struct {
+	Enabled         bool  `json:"enabled" protobuf:"varint,1,opt,name=enabled"`
+	DurationSeconds int64 `json:"durationSeconds" protobuf:"varint,2,opt,name=durationSeconds"`
 }
 
 // RolloutTrafficRouting hosts all the different configuration for supported service meshes to enable more fine-grained traffic routing
@@ -532,6 +541,11 @@ type RolloutAnalysis struct {
 	// +patchMergeKey=name
 	// +patchStrategy=merge
 	Args []AnalysisRunArgument `json:"args,omitempty" patchStrategy:"merge" patchMergeKey:"name" protobuf:"bytes,2,rep,name=args"`
+	// DryRun object contains the settings for running the analysis in Dry-Run mode
+	// +patchMergeKey=metricName
+	// +patchStrategy=merge
+	// +optional
+	DryRun []DryRun `json:"dryRun,omitempty" patchStrategy:"merge" patchMergeKey:"metricName" protobuf:"bytes,3,rep,name=dryRun"`
 }
 
 type RolloutAnalysisTemplate struct {
@@ -715,9 +729,6 @@ type RolloutStatus struct {
 	// The generation observed by the rollout controller from metadata.generation
 	// +optional
 	ObservedGeneration string `json:"observedGeneration,omitempty" protobuf:"bytes,13,opt,name=observedGeneration"`
-	// The generation of referenced workload observed by the rollout controller
-	// +optional
-	WorkloadObservedGeneration string `json:"workloadObservedGeneration,omitempty" protobuf:"bytes,24,opt,name=workloadObservedGeneration"`
 	// Conditions a list of conditions a rollout can have.
 	// +optional
 	Conditions []RolloutCondition `json:"conditions,omitempty" protobuf:"bytes,14,rep,name=conditions"`
@@ -744,6 +755,11 @@ type RolloutStatus struct {
 	Phase RolloutPhase `json:"phase,omitempty" protobuf:"bytes,22,opt,name=phase,casttype=RolloutPhase"`
 	// Message provides details on why the rollout is in its current phase
 	Message string `json:"message,omitempty" protobuf:"bytes,23,opt,name=message"`
+	// The generation of referenced workload observed by the rollout controller
+	// +optional
+	WorkloadObservedGeneration string `json:"workloadObservedGeneration,omitempty" protobuf:"bytes,24,opt,name=workloadObservedGeneration"`
+	/// ALB keeps information regarding the ALB and TargetGroups
+	ALB ALBStatus `json:"alb,omitempty" protobuf:"bytes,25,opt,name=alb"`
 }
 
 // BlueGreenStatus status fields that only pertain to the blueGreen rollout
@@ -801,6 +817,17 @@ type RolloutAnalysisRunStatus struct {
 	Name    string        `json:"name" protobuf:"bytes,1,opt,name=name"`
 	Status  AnalysisPhase `json:"status" protobuf:"bytes,2,opt,name=status,casttype=AnalysisPhase"`
 	Message string        `json:"message,omitempty" protobuf:"bytes,3,opt,name=message"`
+}
+
+type ALBStatus struct {
+	LoadBalancer      AwsResourceRef `json:"loadBalancer,omitempty" protobuf:"bytes,1,opt,name=loadBalancer"`
+	CanaryTargetGroup AwsResourceRef `json:"canaryTargetGroup,omitempty" protobuf:"bytes,2,opt,name=canaryTargetGroup"`
+	StableTargetGroup AwsResourceRef `json:"stableTargetGroup,omitempty" protobuf:"bytes,3,opt,name=stableTargetGroup"`
+}
+
+type AwsResourceRef struct {
+	Name string `json:"name" protobuf:"bytes,1,opt,name=name"`
+	ARN  string `json:"arn" protobuf:"bytes,2,opt,name=arn"`
 }
 
 // RolloutConditionType defines the conditions of Rollout
