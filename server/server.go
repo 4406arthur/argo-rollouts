@@ -1,13 +1,15 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"embed"
 	"fmt"
-	"io/fs"
 	"net"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/argoproj/pkg/errors"
@@ -60,6 +62,7 @@ type ServerOptions struct {
 	RolloutsClientset rolloutclientset.Interface
 	DynamicClientset  dynamic.Interface
 	Namespace         string
+	RootPath          string
 }
 
 const (
@@ -90,6 +93,35 @@ func (fs *spaFileSystem) Open(name string) (http.File, error) {
 	return f, err
 }
 
+//This function helps in changing base href to point to rootpath as basepath, we are making modification in only server/static/index.html file
+func withRootPath(rootpath string) {
+	inputFile, inputError := os.Open("./server/static/index.html")
+	if inputError != nil {
+		log.Error("An error occurred on opening the inputfile\n" +
+			"Does the file exist?\n" +
+			"Have you got access to it?\n")
+		panic(inputError) // exit on error
+	}
+	defer inputFile.Close()
+	inputReader := bufio.NewReader(inputFile)
+	inputString, _ := inputReader.ReadString('\n')
+	re := regexp.MustCompile(`<base href="/[^/]*/*"/>`)
+	var temp = re.ReplaceAllString(inputString, "<base href=\"/"+rootpath+"/\"/>") // href="/root/"
+
+	outputFile, _ := os.OpenFile("./server/static/index.html", os.O_TRUNC|os.O_WRONLY, 0666)
+	defer outputFile.Close()
+	outputWriter := bufio.NewWriter(outputFile)
+	outputWriter.WriteString(temp)
+	outputWriter.Flush()
+
+	//To make ui/dist/index.html file consistent with server/static/index.html
+	outputFileDist, _ := os.OpenFile("./ui/dist/app/index.html", os.O_TRUNC|os.O_WRONLY, 0666)
+	defer outputFileDist.Close()
+	outputWriterDist := bufio.NewWriter(outputFileDist)
+	outputWriterDist.WriteString(temp)
+	outputWriterDist.Flush()
+}
+
 func (s *ArgoRolloutsServer) newHTTPServer(ctx context.Context, port int) *http.Server {
 	mux := http.NewServeMux()
 	endpoint := fmt.Sprintf("0.0.0.0:%d", port)
@@ -101,7 +133,11 @@ func (s *ArgoRolloutsServer) newHTTPServer(ctx context.Context, port int) *http.
 
 	gwMuxOpts := runtime.WithMarshalerOption(runtime.MIMEWildcard, new(json.JSONMarshaler))
 	gwmux := runtime.NewServeMux(gwMuxOpts,
-		runtime.WithIncomingHeaderMatcher(func(key string) (string, bool) { return key, true }),
+		runtime.WithIncomingHeaderMatcher(func(key string) (string, bool) {
+			// Dropping "Connection" header as a workaround for https://github.com/grpc-ecosystem/grpc-gateway/issues/2447
+			// The fix is part of grpc-gateway v2.x but not available in v1.x, so workaround should be removed after upgrading to grpc v2.x
+			return key, strings.ToLower(key) != "connection"
+		}),
 		runtime.WithProtoErrorHandler(runtime.DefaultHTTPProtoErrorHandler),
 	)
 
@@ -117,14 +153,11 @@ func (s *ArgoRolloutsServer) newHTTPServer(ctx context.Context, port int) *http.
 
 	var handler http.Handler = gwmux
 
-	ui, err := fs.Sub(static, "static")
-	if err != nil {
-		log.Error("Could not load UI static files")
-		panic(err)
-	}
+	withRootPath(s.Options.RootPath)
 
 	mux.Handle("/api/", handler)
-	mux.Handle("/", http.FileServer(&spaFileSystem{http.FS(ui)}))
+
+	mux.Handle("/"+s.Options.RootPath+"/", http.StripPrefix("/"+s.Options.RootPath+"/", http.FileServer(http.Dir("./server/static"))))
 
 	return &httpS
 }
@@ -269,7 +302,7 @@ func (s *ArgoRolloutsServer) ListRolloutInfos(ctx context.Context, q *rollout.Ro
 	var riList []*rollout.RolloutInfo
 	for i := range rolloutList.Items {
 		cur := rolloutList.Items[i]
-		ri := info.NewRolloutInfo(&cur, nil, nil, nil, nil)
+		ri := info.NewRolloutInfo(&cur, nil, nil, nil, nil, nil)
 		ri.ReplicaSets = info.GetReplicaSetInfo(cur.UID, &cur, allReplicaSets, allPods)
 		riList = append(riList, ri)
 	}
@@ -346,7 +379,7 @@ func (s *ArgoRolloutsServer) WatchRolloutInfos(q *rollout.RolloutInfoListQuery, 
 			}
 
 			// get shallow rollout info
-			ri := info.NewRolloutInfo(ro, allReplicaSets, allPods, nil, nil)
+			ri := info.NewRolloutInfo(ro, allReplicaSets, allPods, nil, nil, nil)
 			send(ri)
 		}
 	}
@@ -358,7 +391,7 @@ func (s *ArgoRolloutsServer) RolloutToRolloutInfo(ro *v1alpha1.Rollout) (*rollou
 	if err != nil {
 		return nil, err
 	}
-	return info.NewRolloutInfo(ro, allReplicaSets, allPods, nil, nil), nil
+	return info.NewRolloutInfo(ro, allReplicaSets, allPods, nil, nil, nil), nil
 }
 
 func (s *ArgoRolloutsServer) GetNamespace(ctx context.Context, e *empty.Empty) (*rollout.NamespaceInfo, error) {
@@ -397,7 +430,10 @@ func (s *ArgoRolloutsServer) getRollout(namespace string, name string) (*v1alpha
 
 func (s *ArgoRolloutsServer) SetRolloutImage(ctx context.Context, q *rollout.SetImageRequest) (*v1alpha1.Rollout, error) {
 	imageString := fmt.Sprintf("%s:%s", q.GetImage(), q.GetTag())
-	set.SetImage(s.Options.DynamicClientset, q.GetNamespace(), q.GetRollout(), q.GetContainer(), imageString)
+	_, err := set.SetImage(s.Options.DynamicClientset, q.GetNamespace(), q.GetRollout(), q.GetContainer(), imageString)
+	if err != nil {
+		return nil, err
+	}
 	return s.getRollout(q.GetNamespace(), q.GetRollout())
 }
 

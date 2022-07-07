@@ -1,6 +1,7 @@
 package rollout
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -322,7 +323,7 @@ func TestPauseRolloutAfterInconclusiveExperiment(t *testing.T) {
 		Experiment: &v1alpha1.RolloutExperimentStep{},
 	}}
 
-	r1 := newCanaryRollout("foo", 1, nil, steps, pointer.Int32Ptr(0), intstr.FromInt(0), intstr.FromInt(1))
+	r1 := newCanaryRollout("foo", 1, nil, steps, pointer.Int32Ptr(0), intstr.FromInt(1), intstr.FromInt(1))
 	r2 := bumpVersion(r1)
 
 	rs1 := newReplicaSetWithStatus(r1, 1, 1)
@@ -343,25 +344,13 @@ func TestPauseRolloutAfterInconclusiveExperiment(t *testing.T) {
 	patchIndex := f.expectPatchRolloutAction(r1)
 	f.run(getKey(r2, t))
 	patch := f.getPatchedRollout(patchIndex)
-	expectedPatchFmt := `{
-		"status": {
-			"canary": {
-				"currentExperiment": null
-			},
-			"pauseConditions": [{
-				"reason": "%s",
-				"startTime": "%s"
-			}],
-			"conditions": %s,
-			"controllerPause": true,
-			"phase": "Paused",
-			"message": "%s"
-		}
-	}`
-	now := metav1.Now().UTC().Format(time.RFC3339)
-	conditions := generateConditionsPatch(true, conditions.ReplicaSetUpdatedReason, r2, false, "")
-	expectedPatch := calculatePatch(r2, fmt.Sprintf(expectedPatchFmt, v1alpha1.PauseReasonInconclusiveExperiment, now, conditions, v1alpha1.PauseReasonInconclusiveExperiment))
-	assert.Equal(t, expectedPatch, patch)
+	ro := v1alpha1.Rollout{}
+	err := json.Unmarshal([]byte(patch), &ro)
+	if err != nil {
+		panic(err)
+	}
+	assert.Equal(t, ro.Status.PauseConditions[0].Reason, v1alpha1.PauseReason("InconclusiveExperiment"))
+	assert.Equal(t, ro.Status.Message, "InconclusiveExperiment")
 }
 
 func TestRolloutExperimentScaleDownExperimentFromPreviousStep(t *testing.T) {
@@ -373,7 +362,7 @@ func TestRolloutExperimentScaleDownExperimentFromPreviousStep(t *testing.T) {
 		{SetWeight: pointer.Int32Ptr(1)},
 	}
 
-	r1 := newCanaryRollout("foo", 1, nil, steps, pointer.Int32Ptr(1), intstr.FromInt(0), intstr.FromInt(1))
+	r1 := newCanaryRollout("foo", 1, nil, steps, pointer.Int32Ptr(1), intstr.FromInt(1), intstr.FromInt(1))
 	r2 := bumpVersion(r1)
 
 	rs1 := newReplicaSetWithStatus(r1, 1, 1)

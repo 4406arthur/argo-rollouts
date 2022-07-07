@@ -26,6 +26,7 @@ import (
 
 	rov1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	clientset "github.com/argoproj/argo-rollouts/pkg/client/clientset/versioned"
+	appmeshutil "github.com/argoproj/argo-rollouts/utils/appmesh"
 	"github.com/argoproj/argo-rollouts/utils/defaults"
 	istioutil "github.com/argoproj/argo-rollouts/utils/istio"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
@@ -35,7 +36,7 @@ import (
 const (
 	// E2E_INSTANCE_ID is the instance id label attached to objects created by the e2e tests
 	EnvVarE2EInstanceID = "E2E_INSTANCE_ID"
-	// E2E_WAIT_TIMEOUT is a timeout in seconds when waiting for a test condition (default: 60)
+	// E2E_WAIT_TIMEOUT is a timeout in seconds when waiting for a test condition (default: 90)
 	EnvVarE2EWaitTimeout = "E2E_WAIT_TIMEOUT"
 	// E2E_POD_DELAY slows down pod startup and shutdown by the value in seconds (default: 0)
 	// Used humans slow down rollout activity during a test
@@ -51,7 +52,7 @@ const (
 )
 
 var (
-	E2EWaitTimeout time.Duration = time.Second * 60
+	E2EWaitTimeout time.Duration = time.Second * 120
 	E2EPodDelay                  = 0
 
 	E2EALBIngressAnnotations map[string]string
@@ -119,8 +120,9 @@ type E2ESuite struct {
 	suite.Suite
 	Common
 
-	IstioEnabled bool
-	SMIEnabled   bool
+	IstioEnabled   bool
+	SMIEnabled     bool
+	AppMeshEnabled bool
 }
 
 func (s *E2ESuite) SetupSuite() {
@@ -158,6 +160,10 @@ func (s *E2ESuite) SetupSuite() {
 
 	if smiutil.DoesSMIExist(s.smiClient, s.namespace) {
 		s.SMIEnabled = true
+	}
+
+	if appmeshutil.DoesAppMeshExist(s.dynamicClient, s.namespace) {
+		s.AppMeshEnabled = true
 	}
 }
 

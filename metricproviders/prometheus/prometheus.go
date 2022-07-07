@@ -2,7 +2,10 @@ package prometheus
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"time"
 
 	"github.com/prometheus/client_golang/api"
@@ -17,8 +20,12 @@ import (
 )
 
 const (
-	//ProviderType indicates the provider is prometheus
+	// ProviderType indicates the provider is prometheus
 	ProviderType = "Prometheus"
+	// ResolvedPrometheusQuery is used as the key for storing the resolved prometheus query in the metrics result
+	// metadata object.
+	ResolvedPrometheusQuery             = "ResolvedPrometheusQuery"
+	EnvVarArgoRolloutsPrometheusAddress = "ARGO_ROLLOUTS_PROMETHEUS_ADDRESS"
 )
 
 // Provider contains all the required components to run a prometheus query
@@ -30,6 +37,15 @@ type Provider struct {
 // Type indicates provider is a prometheus provider
 func (p *Provider) Type() string {
 	return ProviderType
+}
+
+// GetMetadata returns any additional metadata which needs to be stored & displayed as part of the metrics result.
+func (p *Provider) GetMetadata(metric v1alpha1.Metric) map[string]string {
+	metricsMetadata := make(map[string]string)
+	if metric.Provider.Prometheus.Query != "" {
+		metricsMetadata[ResolvedPrometheusQuery] = metric.Provider.Prometheus.Query
+	}
+	return metricsMetadata
 }
 
 // Run queries prometheus for the metric
@@ -128,12 +144,39 @@ func NewPrometheusProvider(api v1.API, logCtx log.Entry) *Provider {
 
 // NewPrometheusAPI generates a prometheus API from the metric configuration
 func NewPrometheusAPI(metric v1alpha1.Metric) (v1.API, error) {
+	envValuesByKey := make(map[string]string)
+	if value, ok := os.LookupEnv(fmt.Sprintf("%s", EnvVarArgoRolloutsPrometheusAddress)); ok {
+		envValuesByKey[EnvVarArgoRolloutsPrometheusAddress] = value
+		log.Debugf("ARGO_ROLLOUTS_PROMETHEUS_ADDRESS: %v", envValuesByKey[EnvVarArgoRolloutsPrometheusAddress])
+	}
+	if len(metric.Provider.Prometheus.Address) != 0 {
+		if !IsUrl(metric.Provider.Prometheus.Address) {
+			return nil, errors.New("prometheus address is not is url format")
+		}
+	} else if envValuesByKey[EnvVarArgoRolloutsPrometheusAddress] != "" {
+		if IsUrl(envValuesByKey[EnvVarArgoRolloutsPrometheusAddress]) {
+			metric.Provider.Prometheus.Address = envValuesByKey[EnvVarArgoRolloutsPrometheusAddress]
+		} else {
+			return nil, errors.New("prometheus address is not is url format")
+		}
+	} else {
+		return nil, errors.New("prometheus address is not configured")
+	}
 	client, err := api.NewClient(api.Config{
 		Address: metric.Provider.Prometheus.Address,
 	})
 	if err != nil {
+		log.Errorf("Error in getting prometheus client: %v", err)
 		return nil, err
 	}
-
 	return v1.NewAPI(client), nil
+}
+
+func IsUrl(str string) bool {
+	u, err := url.Parse(str)
+	if err != nil {
+		log.Errorf("Error in parsing url: %v", err)
+	}
+	log.Debugf("Parsed url: %v", u)
+	return err == nil && u.Scheme != "" && u.Host != ""
 }

@@ -1,15 +1,19 @@
 package rollout
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/alb"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/ambassador"
+	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/appmesh"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/istio"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/nginx"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/smi"
+	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/traefik"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
 	"github.com/argoproj/argo-rollouts/utils/defaults"
 	"github.com/argoproj/argo-rollouts/utils/record"
@@ -73,6 +77,21 @@ func (c *Controller) NewTrafficRoutingReconciler(roCtx *rolloutContext) ([]traff
 		ac := ambassador.NewDynamicClient(c.dynamicclientset, rollout.GetNamespace())
 		trafficReconcilers = append(trafficReconcilers, ambassador.NewReconciler(rollout, ac, c.recorder))
 	}
+	if rollout.Spec.Strategy.Canary.TrafficRouting.AppMesh != nil {
+		trafficReconcilers = append(trafficReconcilers, appmesh.NewReconciler(appmesh.ReconcilerConfig{
+			Rollout:  rollout,
+			Client:   c.dynamicclientset,
+			Recorder: c.recorder,
+		}))
+	}
+	if rollout.Spec.Strategy.Canary.TrafficRouting.Traefik != nil {
+		dynamicClient := traefik.NewDynamicClient(c.dynamicclientset, rollout.GetNamespace())
+		trafficReconcilers = append(trafficReconcilers, traefik.NewReconciler(&traefik.ReconcilerConfig{
+			Rollout:  rollout,
+			Client:   dynamicClient,
+			Recorder: c.recorder,
+		}))
+	}
 
 	// ensure that the trafficReconcilers is a healthy list and its not empty
 	if len(trafficReconcilers) > 0 {
@@ -119,16 +138,44 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 
 		if rolloututil.IsFullyPromoted(c.rollout) {
 			// when we are fully promoted. desired canary weight should be 0
+			err := reconciler.RemoveManagedRoutes()
+			if err != nil {
+				return err
+			}
 		} else if c.pauseContext.IsAborted() {
-			// when aborted, desired canary weight should be 0 (100% to stable), *unless* we
-			// are using dynamic stable scaling. In that case, we can only decrease canary weight
-			// according to available replica counts of the stable.
+			// when aborted, desired canary weight should immediately be 0 (100% to stable), *unless*
+			// we are using dynamic stable scaling. In that case, we are dynamically decreasing the
+			// weight to the canary according to the availability of the stable (whatever it can support).
 			if c.rollout.Spec.Strategy.Canary.DynamicStableScale {
 				desiredWeight = 100 - ((100 * c.stableRS.Status.AvailableReplicas) / *c.rollout.Spec.Replicas)
+				if c.rollout.Status.Canary.Weights != nil {
+					// This ensures that if we are already at a lower weight, then we will not
+					// increase the weight because stable availability is flapping (e.g. pod restarts)
+					desiredWeight = minInt(desiredWeight, c.rollout.Status.Canary.Weights.Canary.Weight)
+				}
 			}
+			err := reconciler.RemoveManagedRoutes()
+			if err != nil {
+				return err
+			}
+
 		} else if c.newRS == nil || c.newRS.Status.AvailableReplicas == 0 {
 			// when newRS is not available or replicas num is 0. never weight to canary
 			weightDestinations = append(weightDestinations, c.calculateWeightDestinationsFromExperiment()...)
+		} else if c.rollout.Status.PromoteFull {
+			// on a promote full, desired stable weight should be 0 (100% to canary),
+			// But we can only increase canary weight according to available replica counts of the canary.
+			// we will need to set the desiredWeight to 0 when the newRS is not available.
+			if c.rollout.Spec.Strategy.Canary.DynamicStableScale {
+				desiredWeight = (100 * c.newRS.Status.AvailableReplicas) / *c.rollout.Spec.Replicas
+			} else if c.rollout.Status.Canary.Weights != nil {
+				desiredWeight = c.rollout.Status.Canary.Weights.Canary.Weight
+			}
+
+			err := reconciler.RemoveManagedRoutes()
+			if err != nil {
+				return err
+			}
 		} else if index != nil {
 			atDesiredReplicaCount := replicasetutil.AtDesiredReplicaCountsForCanary(c.rollout, c.newRS, c.stableRS, c.otherRSs, nil)
 			if !atDesiredReplicaCount && !c.rollout.Status.PromoteFull {
@@ -140,16 +187,31 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 						break
 					}
 				}
+				weightDestinations = append(weightDestinations, c.calculateWeightDestinationsFromExperiment()...)
 			} else if *index != int32(len(c.rollout.Spec.Strategy.Canary.Steps)) {
-				// This if statement prevents the desiredWeight from being set to 100
-				// when the rollout has progressed through all the steps. The rollout
-				// should send all traffic to the stable service by using a weight of
-				// 0. If the rollout is progressing through the steps, the desired
+				// If the rollout is progressing through the steps, the desired
 				// weight of the traffic routing service should be at the value of the
 				// last setWeight step, which is set by GetCurrentSetWeight.
 				desiredWeight = replicasetutil.GetCurrentSetWeight(c.rollout)
+				weightDestinations = append(weightDestinations, c.calculateWeightDestinationsFromExperiment()...)
+			} else {
+				desiredWeight = 100
 			}
-			weightDestinations = append(weightDestinations, c.calculateWeightDestinationsFromExperiment()...)
+		}
+
+		// We need to check for Generation > 1 because when we first install the rollout we run step 0 this prevents that.
+		// We could also probably use c.newRS == nil || c.newRS.Status.AvailableReplicas == 0
+		if currentStep != nil && c.rollout.ObjectMeta.Generation > 1 {
+			if currentStep.SetHeaderRoute != nil {
+				if err = reconciler.SetHeaderRoute(currentStep.SetHeaderRoute); err != nil {
+					return err
+				}
+			}
+			if currentStep.SetMirrorRoute != nil {
+				if err = reconciler.SetMirrorRoute(currentStep.SetMirrorRoute); err != nil {
+					return err
+				}
+			}
 		}
 
 		err = reconciler.UpdateHash(canaryHash, stableHash, weightDestinations...)
@@ -162,9 +224,11 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 			c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: "TrafficRoutingError"}, err.Error())
 			return err
 		}
+
 		if modified, newWeights := calculateWeightStatus(c.rollout, canaryHash, stableHash, desiredWeight, weightDestinations...); modified {
 			c.log.Infof("Previous weights: %v", c.rollout.Status.Canary.Weights)
 			c.log.Infof("New weights: %v", newWeights)
+			c.recorder.Eventf(c.rollout, record.EventOptions{EventReason: conditions.TrafficWeightUpdatedReason}, trafficWeightUpdatedMessage(c.rollout.Status.Canary.Weights, newWeights))
 			c.newStatus.Canary.Weights = newWeights
 		}
 
@@ -193,6 +257,20 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 		}
 	}
 	return nil
+}
+
+// trafficWeightUpdatedMessage returns a message we emit for the kubernetes event whenever we adjust traffic weights
+func trafficWeightUpdatedMessage(prev, new *v1alpha1.TrafficWeights) string {
+	var details []string
+	if prev == nil {
+		details = append(details, fmt.Sprintf("to %d", new.Canary.Weight))
+	} else if prev.Canary.Weight != new.Canary.Weight {
+		details = append(details, fmt.Sprintf("from %d to %d", prev.Canary.Weight, new.Canary.Weight))
+	}
+	if prev != nil && new != nil && !reflect.DeepEqual(prev.Additional, new.Additional) {
+		details = append(details, fmt.Sprintf("additional: %v", new.Additional))
+	}
+	return fmt.Sprintf(conditions.TrafficWeightUpdatedMessage, strings.Join(details, ", "))
 }
 
 // calculateWeightStatus calculates the Rollout's `status.canary.weights` values. Returns true if

@@ -15,6 +15,10 @@ import (
 	"github.com/argoproj/argo-rollouts/utils/defaults"
 )
 
+const (
+	errTrafficRoutingWithExperimentSupport = "Experiment template weight is only available for TrafficRouting with SMI, ALB, and Istio at this time"
+)
+
 func TestValidateRollout(t *testing.T) {
 	selector := &metav1.LabelSelector{
 		MatchLabels: map[string]string{"key": "value"},
@@ -129,7 +133,7 @@ func TestValidateRolloutStrategyCanary(t *testing.T) {
 		CanaryService: "canary",
 		StableService: "stable",
 		TrafficRouting: &v1alpha1.RolloutTrafficRouting{
-			SMI: &v1alpha1.SMITrafficRouting{},
+			ALB: &v1alpha1.ALBTrafficRouting{RootService: "root-service"},
 		},
 		Steps: []v1alpha1.CanaryStep{{}},
 	}
@@ -165,6 +169,47 @@ func TestValidateRolloutStrategyCanary(t *testing.T) {
 		invalidRo.Spec.Strategy.Canary.CanaryService = "stable"
 		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
 		assert.Equal(t, DuplicatedServicesCanaryMessage, allErrs[0].Detail)
+	})
+
+	t.Run("duplicate ping pong services", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.PingPong = &v1alpha1.PingPongSpec{PingService: "ping", PongService: "ping"}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, DuplicatedPingPongServicesMessage, allErrs[0].Detail)
+	})
+
+	t.Run("ping services using only", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.PingPong = &v1alpha1.PingPongSpec{PingService: "ping", PongService: ""}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalidPingPongProvidedMessage, allErrs[0].Detail)
+	})
+
+	t.Run("pong service using only", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.PingPong = &v1alpha1.PingPongSpec{PingService: "", PongService: "pong"}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalidPingPongProvidedMessage, allErrs[0].Detail)
+	})
+
+	t.Run("missed ALB root service for the ping-pong feature", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.PingPong = &v1alpha1.PingPongSpec{PingService: "ping", PongService: "pong"}
+		invalidRo.Spec.Strategy.Canary.TrafficRouting = &v1alpha1.RolloutTrafficRouting{
+			ALB: &v1alpha1.ALBTrafficRouting{RootService: ""},
+		}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, MissedAlbRootServiceMessage, allErrs[0].Detail)
+	})
+
+	t.Run("ping-pong feature without the ALB traffic routing", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.PingPong = &v1alpha1.PingPongSpec{PingService: "ping", PongService: "pong"}
+		invalidRo.Spec.Strategy.Canary.TrafficRouting = &v1alpha1.RolloutTrafficRouting{
+			Nginx: &v1alpha1.NginxTrafficRouting{StableIngress: "stable-ingress"},
+		}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, PingPongWithAlbOnlyMessage, allErrs[0].Detail)
 	})
 
 	t.Run("invalid traffic routing", func(t *testing.T) {
@@ -234,6 +279,216 @@ func TestValidateRolloutStrategyAntiAffinity(t *testing.T) {
 	}
 	allErrs = ValidateRolloutStrategyAntiAffinity(&antiAffinity, field.NewPath("antiAffinity"))
 	assert.Equal(t, InvalidAntiAffinityWeightMessage, allErrs[0].Detail)
+}
+
+func TestValidateRolloutStrategyCanarySetHeaderRouteIstio(t *testing.T) {
+	ro := &v1alpha1.Rollout{}
+	ro.Spec.Strategy.Canary = &v1alpha1.CanaryStrategy{
+		CanaryService: "canary",
+		StableService: "stable",
+		TrafficRouting: &v1alpha1.RolloutTrafficRouting{
+			Istio: &v1alpha1.IstioTrafficRouting{
+				VirtualService: &v1alpha1.IstioVirtualService{Name: "virtual-service"},
+			},
+		},
+	}
+
+	t.Run("using SetHeaderRoute step without the traffic routing", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.TrafficRouting = nil
+		invalidRo.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+			SetHeaderRoute: &v1alpha1.SetHeaderRoute{
+				Match: []v1alpha1.HeaderRoutingMatch{
+					{
+						HeaderName:  "agent",
+						HeaderValue: &v1alpha1.StringMatch{Exact: "chrome"},
+					},
+				},
+			},
+		}}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalidSetHeaderRoutingTrafficPolicy, allErrs[0].Detail)
+	})
+
+	t.Run("using SetHeaderRoute step with multiple values", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+			SetHeaderRoute: &v1alpha1.SetHeaderRoute{
+				Match: []v1alpha1.HeaderRoutingMatch{
+					{
+						HeaderName: "agent",
+						HeaderValue: &v1alpha1.StringMatch{
+							Exact: "chrome",
+							Regex: "chrome(.*)",
+						},
+					},
+				},
+			},
+		}}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalidStringMatchMultipleValuePolicy, allErrs[0].Detail)
+	})
+
+	t.Run("using SetHeaderRoute step with missed values", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+			SetHeaderRoute: &v1alpha1.SetHeaderRoute{
+				Match: []v1alpha1.HeaderRoutingMatch{
+					{
+						HeaderName: "agent",
+					},
+				},
+			},
+		}}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalidStringMatchMissedValuePolicy, allErrs[0].Detail)
+	})
+
+	t.Run("using SetHeaderRoute step without managedRoutes defined but missing route", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+			SetHeaderRoute: &v1alpha1.SetHeaderRoute{
+				Match: []v1alpha1.HeaderRoutingMatch{
+					{
+						HeaderName:  "agent",
+						HeaderValue: &v1alpha1.StringMatch{Exact: "exact"},
+					},
+				},
+			},
+		}}
+		invalidRo.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes = append(invalidRo.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes, v1alpha1.MangedRoutes{
+			Name: "not-in-steps",
+		})
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalideStepRouteNameNotFoundInManagedRoutes, allErrs[0].Detail)
+	})
+}
+
+func TestValidateRolloutStrategyCanarySetMirrorRouteIstio(t *testing.T) {
+	ro := &v1alpha1.Rollout{}
+	ro.Spec.Strategy.Canary = &v1alpha1.CanaryStrategy{
+		CanaryService: "canary",
+		StableService: "stable",
+		TrafficRouting: &v1alpha1.RolloutTrafficRouting{
+			Istio: &v1alpha1.IstioTrafficRouting{
+				VirtualService: &v1alpha1.IstioVirtualService{Name: "virtual-service"},
+			},
+		},
+	}
+
+	t.Run("using SetMirrorRoute step without the traffic routing", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.TrafficRouting = nil
+		invalidRo.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+			SetMirrorRoute: &v1alpha1.SetMirrorRoute{
+				Name:       "test-mirror-1",
+				Match:      nil,
+				Percentage: nil,
+			},
+		}}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalidSetMirrorRouteTrafficPolicy, allErrs[0].Detail)
+	})
+
+	t.Run("using SetMirrorRoute step with multiple values", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+			SetMirrorRoute: &v1alpha1.SetMirrorRoute{
+				Name: "test-mirror-1",
+				Match: []v1alpha1.RouteMatch{{
+					Method: &v1alpha1.StringMatch{
+						Exact:  "test",
+						Prefix: "test",
+					},
+					Path:    nil,
+					Headers: nil,
+				}},
+				Percentage: nil,
+			},
+		}}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalidStringMatchMultipleValuePolicy, allErrs[0].Detail)
+	})
+
+	t.Run("using SetMirrorRoute step with missed match and no kind", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+			SetMirrorRoute: &v1alpha1.SetMirrorRoute{
+				Name: "test-mirror-1",
+				Match: []v1alpha1.RouteMatch{{
+					Method:  &v1alpha1.StringMatch{},
+					Path:    nil,
+					Headers: nil,
+				}},
+				Percentage: nil,
+			},
+		}}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalidStringMatchMissedValuePolicy, allErrs[0].Detail)
+	})
+
+	t.Run("using SetMirrorRoute step without managedRoutes not defined", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+			SetMirrorRoute: &v1alpha1.SetMirrorRoute{
+				Name: "test-mirror-1",
+				Match: []v1alpha1.RouteMatch{{
+					Method: &v1alpha1.StringMatch{
+						Exact: "exact",
+					},
+				}},
+				Percentage: nil,
+			},
+		}}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalidStepMissingManagedRoutesField, allErrs[0].Detail)
+	})
+
+	t.Run("using SetMirrorRoute step without managedRoutes defined but missing route", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+			SetMirrorRoute: &v1alpha1.SetMirrorRoute{
+				Name: "test-mirror-1",
+				Match: []v1alpha1.RouteMatch{{
+					Method: &v1alpha1.StringMatch{
+						Exact: "GET",
+					},
+					Path: &v1alpha1.StringMatch{
+						Prefix: "/",
+					},
+				}},
+				Percentage: nil,
+			},
+		}}
+		invalidRo.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes = append(invalidRo.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes, v1alpha1.MangedRoutes{
+			Name: "not-in-steps",
+		})
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, InvalideStepRouteNameNotFoundInManagedRoutes, allErrs[0].Detail)
+	})
+
+	t.Run("using SetMirrorRoute step with managedRoutes defined", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+			SetMirrorRoute: &v1alpha1.SetMirrorRoute{
+				Name: "test-mirror-1",
+				Match: []v1alpha1.RouteMatch{{
+					Method: &v1alpha1.StringMatch{
+						Exact: "GET",
+					},
+					Path: &v1alpha1.StringMatch{
+						Prefix: "/",
+					},
+				}},
+				Percentage: nil,
+			},
+		}}
+		invalidRo.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes = append(invalidRo.Spec.Strategy.Canary.TrafficRouting.ManagedRoutes, v1alpha1.MangedRoutes{
+			Name: "test-mirror-1",
+		})
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Len(t, allErrs, 0)
+	})
 }
 
 func TestInvalidMaxSurgeMaxUnavailable(t *testing.T) {
@@ -438,7 +693,7 @@ func TestCanaryExperimentStepWithWeight(t *testing.T) {
 		invalidRo.Spec.Strategy.Canary.TrafficRouting = &v1alpha1.RolloutTrafficRouting{}
 		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
 		assert.Equal(t, 1, len(allErrs))
-		assert.Equal(t, "Experiment template weight is only available for TrafficRouting with SMI, ALB, and Istio at this time", allErrs[0].Detail)
+		assert.Equal(t, errTrafficRoutingWithExperimentSupport, allErrs[0].Detail)
 	})
 
 	t.Run("unsupported - Nginx TrafficRouting", func(t *testing.T) {
@@ -450,7 +705,7 @@ func TestCanaryExperimentStepWithWeight(t *testing.T) {
 		}
 		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
 		assert.Equal(t, 1, len(allErrs))
-		assert.Equal(t, "Experiment template weight is only available for TrafficRouting with SMI, ALB, and Istio at this time", allErrs[0].Detail)
+		assert.Equal(t, errTrafficRoutingWithExperimentSupport, allErrs[0].Detail)
 	})
 
 	t.Run("unsupported - Ambassador TrafficRouting", func(t *testing.T) {
@@ -462,7 +717,7 @@ func TestCanaryExperimentStepWithWeight(t *testing.T) {
 		}
 		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
 		assert.Equal(t, 1, len(allErrs))
-		assert.Equal(t, "Experiment template weight is only available for TrafficRouting with SMI, ALB, and Istio at this time", allErrs[0].Detail)
+		assert.Equal(t, errTrafficRoutingWithExperimentSupport, allErrs[0].Detail)
 	})
 
 	t.Run("unsupported - Istio TrafficRouting", func(t *testing.T) {
@@ -495,4 +750,15 @@ func TestCanaryExperimentStepWithWeight(t *testing.T) {
 		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
 		assert.Equal(t, 0, len(allErrs))
 	})
+
+	t.Run("unsupported - AppMesh TrafficRouting", func(t *testing.T) {
+		invalidRo := ro.DeepCopy()
+		invalidRo.Spec.Strategy.Canary.TrafficRouting = &v1alpha1.RolloutTrafficRouting{
+			AppMesh: &v1alpha1.AppMeshTrafficRouting{},
+		}
+		allErrs := ValidateRolloutStrategyCanary(invalidRo, field.NewPath(""))
+		assert.Equal(t, 1, len(allErrs))
+		assert.Equal(t, errTrafficRoutingWithExperimentSupport, allErrs[0].Detail)
+	})
+
 }

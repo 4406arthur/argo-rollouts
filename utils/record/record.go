@@ -3,31 +3,32 @@ package record
 import (
 	"context"
 	"encoding/json"
-
-	"github.com/argoproj/notifications-engine/pkg/services"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/tools/cache"
-
 	"regexp"
 	"strings"
 	"time"
 
-	k8sinformers "k8s.io/client-go/informers"
+	timeutil "github.com/argoproj/argo-rollouts/utils/time"
 
 	"github.com/argoproj/notifications-engine/pkg/api"
+	"github.com/argoproj/notifications-engine/pkg/services"
 	"github.com/argoproj/notifications-engine/pkg/subscriptions"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	k8sinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/kubectl/pkg/scheme"
 
+	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	rolloutscheme "github.com/argoproj/argo-rollouts/pkg/client/clientset/versioned/scheme"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
 )
@@ -66,13 +67,18 @@ type EventRecorderAdapter struct {
 	Recorder record.EventRecorder
 	// RolloutEventCounter is a counter to increment on events
 	RolloutEventCounter *prometheus.CounterVec
+	// NotificationFailCounter is a counter to increment on failing to send notifications
+	NotificationFailedCounter *prometheus.CounterVec
+	// NotificationSuccessCounter is a counter to increment on successful send notifications
+	NotificationSuccessCounter  *prometheus.CounterVec
+	NotificationSendPerformance *prometheus.HistogramVec
 
 	eventf func(object runtime.Object, warn bool, opts EventOptions, messageFmt string, args ...interface{})
 	// apiFactory is a notifications engine API factory
 	apiFactory api.Factory
 }
 
-func NewEventRecorder(kubeclientset kubernetes.Interface, rolloutEventCounter *prometheus.CounterVec, apiFactory api.Factory) EventRecorder {
+func NewEventRecorder(kubeclientset kubernetes.Interface, rolloutEventCounter *prometheus.CounterVec, notificationFailedCounter *prometheus.CounterVec, notificationSuccessCounter *prometheus.CounterVec, notificationSendPerformance *prometheus.HistogramVec, apiFactory api.Factory) EventRecorder {
 	// Create event broadcaster
 	// Add argo-rollouts custom resources to the default Kubernetes Scheme so Events can be
 	// logged for argo-rollouts types.
@@ -81,9 +87,12 @@ func NewEventRecorder(kubeclientset kubernetes.Interface, rolloutEventCounter *p
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeclientset.CoreV1().Events("")})
 	k8srecorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
 	recorder := &EventRecorderAdapter{
-		Recorder:            k8srecorder,
-		RolloutEventCounter: rolloutEventCounter,
-		apiFactory:          apiFactory,
+		Recorder:                    k8srecorder,
+		RolloutEventCounter:         rolloutEventCounter,
+		NotificationFailedCounter:   notificationFailedCounter,
+		NotificationSuccessCounter:  notificationSuccessCounter,
+		NotificationSendPerformance: notificationSendPerformance,
+		apiFactory:                  apiFactory,
 	}
 	recorder.eventf = recorder.defaultEventf
 	return recorder
@@ -138,6 +147,26 @@ func NewFakeEventRecorder() *FakeEventRecorder {
 			},
 			[]string{"name", "namespace", "type", "reason"},
 		),
+		prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "notification_send_error",
+			},
+			[]string{"name", "namespace", "type", "reason"},
+		),
+		prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "notification_send_success",
+			},
+			[]string{"name", "namespace", "type", "reason"},
+		),
+		prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "notification_send_performance",
+				Help:    "Notification send performance.",
+				Buckets: []float64{0.01, 0.15, .25, .5, 1},
+			},
+			[]string{"namespace", "name"},
+		),
 		NewFakeApiFactory(),
 	).(*EventRecorderAdapter)
 	recorder.Recorder = record.NewFakeRecorder(1000)
@@ -179,7 +208,9 @@ func (e *EventRecorderAdapter) defaultEventf(object runtime.Object, warn bool, o
 		err := e.sendNotifications(object, opts)
 		if err != nil {
 			logCtx.Errorf("Notifications failed to send for eventReason %s with error: %s", opts.EventReason, err)
+			e.NotificationFailedCounter.WithLabelValues(namespace, name, opts.EventType, opts.EventReason).Inc()
 		}
+		e.NotificationSuccessCounter.WithLabelValues(namespace, name, opts.EventType, opts.EventReason).Inc()
 	}
 
 	logFn := logCtx.Infof
@@ -208,6 +239,13 @@ func NewAPIFactorySettings() api.Settings {
 // Send notifications for triggered event if user is subscribed
 func (e *EventRecorderAdapter) sendNotifications(object runtime.Object, opts EventOptions) error {
 	logCtx := logutil.WithObject(object)
+	_, namespace, name := logutil.KindNamespaceName(logCtx)
+	startTime := timeutil.Now()
+	defer func() {
+		duration := time.Since(startTime)
+		e.NotificationSendPerformance.WithLabelValues(namespace, name).Observe(duration.Seconds())
+		logCtx.WithField("time_ms", duration.Seconds()*1e3).Debug("Notification sent")
+	}()
 	notificationsAPI, err := e.apiFactory.GetAPI()
 	if err != nil {
 		// don't return error if notifications are not configured and rollout has no subscribers
@@ -235,23 +273,77 @@ func (e *EventRecorderAdapter) sendNotifications(object runtime.Object, opts Eve
 		return nil
 	}
 
-	objBytes, err := json.Marshal(object)
+	objMap, err := toObjectMap(object)
 	if err != nil {
 		return err
+	}
+
+	res, err := notificationsAPI.RunTrigger(trigger, objMap)
+	if err != nil {
+		log.Errorf("Failed to execute condition of trigger %s: %v", trigger, err)
+		return err
+	}
+	log.Infof("Trigger %s result: %v", trigger, res)
+
+	for _, dest := range destinations {
+		for _, c := range res {
+			if c.Triggered == true {
+				err = notificationsAPI.Send(objMap, triggerActions[0].Send, dest)
+				if err != nil {
+					log.Errorf("notification error: %s", err.Error())
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// toObjectMap converts an object to a map for the purposes of sending to the notification engine
+func toObjectMap(object interface{}) (map[string]interface{}, error) {
+	objBytes, err := json.Marshal(object)
+	if err != nil {
+		return nil, err
 	}
 	var objMap map[string]interface{}
 	err = json.Unmarshal(objBytes, &objMap)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, dest := range destinations {
-		err = notificationsAPI.Send(objMap, triggerActions[0].Send, dest)
+
+	// The JSON marshalling above drops the `spec.template` and `spec.selectors` fields if the rollout
+	// is using workload referencing. The following restores those fields in the returned object map
+	// so that notification templates can refer to them (as if workload ref was not used).
+	if ro, ok := object.(*v1alpha1.Rollout); ok && ro.Spec.WorkloadRef != nil {
+		templateBytes, err := json.Marshal(ro.Spec.Template)
 		if err != nil {
-			log.Errorf("notification error: %s", err.Error())
-			return err
+			return nil, err
+		}
+		var templateMap map[string]interface{}
+		err = json.Unmarshal(templateBytes, &templateMap)
+		if err != nil {
+			return nil, err
+		}
+		err = unstructured.SetNestedMap(objMap, templateMap, "spec", "template")
+		if err != nil {
+			return nil, err
+		}
+
+		selectorBytes, err := json.Marshal(ro.Spec.Selector)
+		if err != nil {
+			return nil, err
+		}
+		var selectorMap map[string]interface{}
+		err = json.Unmarshal(selectorBytes, &selectorMap)
+		if err != nil {
+			return nil, err
+		}
+		err = unstructured.SetNestedMap(objMap, selectorMap, "spec", "selector")
+		if err != nil {
+			return nil, err
 		}
 	}
-	return nil
+	return objMap, nil
 }
 
 func translateReasonToTrigger(reason string) string {

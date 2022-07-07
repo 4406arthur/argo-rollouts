@@ -22,6 +22,7 @@ func NewRolloutInfo(
 	allPods []*corev1.Pod,
 	allExperiments []*v1alpha1.Experiment,
 	allARs []*v1alpha1.AnalysisRun,
+	workloadRef *appsv1.Deployment,
 ) *rollout.RolloutInfo {
 
 	roInfo := rollout.RolloutInfo{
@@ -64,7 +65,11 @@ func NewRolloutInfo(
 					}
 				}
 			} else {
-				roInfo.ActualWeight = roInfo.SetWeight
+				if ro.Status.Canary.Weights != nil {
+					roInfo.ActualWeight = fmt.Sprintf("%d", ro.Status.Canary.Weights.Canary.Weight)
+				} else {
+					roInfo.ActualWeight = roInfo.SetWeight
+				}
 			}
 		}
 	} else if ro.Spec.Strategy.BlueGreen != nil {
@@ -75,9 +80,16 @@ func NewRolloutInfo(
 	roInfo.Message = message
 	roInfo.Icon = rolloutIcon(roInfo.Status)
 	roInfo.Containers = []*rollout.ContainerInfo{}
-	for c := range ro.Spec.Template.Spec.Containers {
-		curContainer := ro.Spec.Template.Spec.Containers[c]
-		roInfo.Containers = append(roInfo.Containers, &rollout.ContainerInfo{Name: curContainer.Name, Image: curContainer.Image})
+
+	var containerList []corev1.Container
+	if workloadRef != nil {
+		containerList = workloadRef.Spec.Template.Spec.Containers
+	} else {
+		containerList = ro.Spec.Template.Spec.Containers
+	}
+
+	for _, c := range containerList {
+		roInfo.Containers = append(roInfo.Containers, &rollout.ContainerInfo{Name: c.Name, Image: c.Image})
 	}
 
 	if ro.Status.RestartedAt != nil {
@@ -138,6 +150,12 @@ func Images(r *rollout.RolloutInfo) []ImageInfo {
 				}
 				if rsInfo.Preview {
 					newImage.Tags = append(newImage.Tags, InfoTagPreview)
+				}
+				if rsInfo.Ping {
+					newImage.Tags = append(newImage.Tags, InfoTagPing)
+				}
+				if rsInfo.Pong {
+					newImage.Tags = append(newImage.Tags, InfoTagPong)
 				}
 				images = mergeImageAndTags(newImage, images)
 			}
@@ -211,7 +229,7 @@ func Revisions(r *rollout.RolloutInfo) []int {
 func ReplicaSetsByRevision(r *rollout.RolloutInfo, rev int) []*rollout.ReplicaSetInfo {
 	var replicaSets []*rollout.ReplicaSetInfo
 	for _, rs := range r.ReplicaSets {
-		if rs.Revision == int32(rev) {
+		if rs.Revision == int64(rev) {
 			replicaSets = append(replicaSets, rs)
 		}
 	}

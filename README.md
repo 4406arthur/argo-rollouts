@@ -39,10 +39,19 @@ For these reasons, in large scale high-volume production environments, a rolling
 * Customizable metric queries and analysis of business KPIs
 * Ingress controller integration: NGINX, ALB
 * Service Mesh integration: Istio, Linkerd, SMI
-* Metric provider integration: Prometheus, Wavefront, Kayenta, Web, Kubernetes Jobs, Datadog, New Relic
+* Metric provider integration: Prometheus, Wavefront, Kayenta, Web, Kubernetes Jobs, Datadog, New Relic, InfluxDB
 
 ## Documentation
 To learn more about Argo Rollouts go to the [complete documentation](https://argoproj.github.io/argo-rollouts/).
+
+## Community 
+
+You can reach the Argo Rollouts community and developers via the following channels:
+
+* Q & A: [Github Discussions](https://github.com/argoproj/argo-rollouts/discussions)
+* Chat: [The #argo-rollouts Slack channel](https://argoproj.github.io/community/join-slack)
+* Contributors Office Hours: [Every Thursday](https://calendar.google.com/calendar/u/0/embed?src=argoproj@gmail.com) | [Agenda](https://docs.google.com/document/d/1xkoFkVviB70YBzSEa4bDnu-rUZ1sIFtwKKG1Uw8XsY8)
+* User Community meeting: [First Wednesday of each month](https://calendar.google.com/calendar/u/0/embed?src=argoproj@gmail.com) | [Agenda](https://docs.google.com/document/d/1ttgw98MO45Dq7ZUHpIiOIEfbyeitKHNfMjbY5dLLMKQ)
 
 ## Who uses Argo Rollouts?
 
@@ -62,5 +71,6 @@ To learn more about Argo Rollouts go to the [complete documentation](https://arg
 * [GitOps with Argo CD and an Argo Rollouts canary release](https://www.youtube.com/watch?v=35Qimb_AZ8U)
 * [Multi-Stage Delivery with Keptn and Argo Rollouts](https://www.youtube.com/watch?v=w-E8FzTbN3g&t=1s)
 * [Gradual Code Releases Using an In-House Kubernetes Canary Controller on top of Argo Rollouts](https://doordash.engineering/2021/04/14/gradual-code-releases-using-an-in-house-kubernetes-canary-controller/)
+* [How Scalable is Argo-Rollouts: A Cloud Operator’s Perspective](https://www.youtube.com/watch?v=rCEhxJ2NSTI)
 
 

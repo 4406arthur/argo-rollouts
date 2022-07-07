@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes sample-controller Authors.
+Copyright 2022 The Kubernetes sample-controller Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@ package github.com.argoproj.argo_rollouts.pkg.apis.rollouts.v1alpha1;
 import "k8s.io/api/batch/v1/generated.proto";
 import "k8s.io/api/core/v1/generated.proto";
 import "k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto";
+import "k8s.io/apimachinery/pkg/runtime/generated.proto";
+import "k8s.io/apimachinery/pkg/runtime/schema/generated.proto";
 import "k8s.io/apimachinery/pkg/util/intstr/generated.proto";
 
 // Package-wide variables from generator "generated".
@@ -114,6 +116,18 @@ message AnalysisRunSpec {
 
   // Terminate is used to prematurely stop the run (e.g. rollout completed and analysis is no longer desired)
   optional bool terminate = 3;
+
+  // DryRun object contains the settings for running the analysis in Dry-Run mode
+  // +patchMergeKey=metricName
+  // +patchStrategy=merge
+  // +optional
+  repeated DryRun dryRun = 4;
+
+  // MeasurementRetention object contains the settings for retaining the number of measurements during the analysis
+  // +patchMergeKey=metricName
+  // +patchStrategy=merge
+  // +optional
+  repeated MeasurementRetention measurementRetention = 5;
 }
 
 // AnalysisRunStatus is the status for a AnalysisRun resource
@@ -129,6 +143,12 @@ message AnalysisRunStatus {
 
   // StartedAt indicates when the analysisRun first started
   optional k8s.io.apimachinery.pkg.apis.meta.v1.Time startedAt = 4;
+
+  // RunSummary contains the final results from the metric executions
+  optional RunSummary runSummary = 5;
+
+  // DryRunSummary contains the final results from the metric executions in the dry-run mode
+  optional RunSummary dryRunSummary = 6;
 }
 
 // AnalysisRunStrategy configuration for the analysis runs and experiments to retain
@@ -172,6 +192,18 @@ message AnalysisTemplateSpec {
   // +patchStrategy=merge
   // +optional
   repeated Argument args = 2;
+
+  // DryRun object contains the settings for running the analysis in Dry-Run mode
+  // +patchMergeKey=metricName
+  // +patchStrategy=merge
+  // +optional
+  repeated DryRun dryRun = 3;
+
+  // MeasurementRetention object contains the settings for retaining the number of measurements during the analysis
+  // +patchMergeKey=metricName
+  // +patchStrategy=merge
+  // +optional
+  repeated MeasurementRetention measurementRetention = 4;
 }
 
 // AntiAffinity defines which inter-pod scheduling rule to use for anti-affinity injection
@@ -181,6 +213,39 @@ message AntiAffinity {
 
   // +optional
   optional RequiredDuringSchedulingIgnoredDuringExecution requiredDuringSchedulingIgnoredDuringExecution = 2;
+}
+
+// AppMeshTrafficRouting configuration for AWS AppMesh service mesh to enable fine grain configuration
+message AppMeshTrafficRouting {
+  // VirtualService references an AppMesh VirtualService and VirtualRouter to modify to shape traffic
+  optional AppMeshVirtualService virtualService = 1;
+
+  // VirtualNodeGroup references an AppMesh Route targets that are formed by a set of VirtualNodes that are used to shape traffic
+  optional AppMeshVirtualNodeGroup virtualNodeGroup = 2;
+}
+
+// AppMeshVirtualNodeGroup holds information about targets used for routing traffic to a virtual service
+message AppMeshVirtualNodeGroup {
+  // CanaryVirtualNodeRef is the virtual node ref to modify labels with canary ReplicaSet pod template hash value
+  optional AppMeshVirtualNodeReference canaryVirtualNodeRef = 1;
+
+  // StableVirtualNodeRef is the virtual node name to modify labels with stable ReplicaSet pod template hash value
+  optional AppMeshVirtualNodeReference stableVirtualNodeRef = 2;
+}
+
+// AppMeshVirtualNodeReference holds a reference to VirtualNode.appmesh.k8s.aws
+message AppMeshVirtualNodeReference {
+  // Name is the name of VirtualNode CR
+  optional string name = 1;
+}
+
+// AppMeshVirtualService holds information on the virtual service the rollout needs to modify
+message AppMeshVirtualService {
+  // Name is the name of virtual service
+  optional string name = 1;
+
+  // Routes is list of HTTP routes within virtual router associated with virtual service to edit. If omitted, virtual service must have a single route of this type.
+  repeated string routes = 2;
 }
 
 // Argument is an argument to an AnalysisRun
@@ -318,6 +383,9 @@ message CanaryStatus {
 
   // Weights records the weights which have been set on traffic provider. Only valid when using traffic routing
   optional TrafficWeights weights = 4;
+
+  // StablePingPong For the ping-pong feature holds the current stable service, ping or pong
+  optional string stablePingPong = 5;
 }
 
 // CanaryStep defines a step of a canary deployment.
@@ -339,6 +407,14 @@ message CanaryStep {
   // SetCanaryScale defines how to scale the newRS without changing traffic weight
   // +optional
   optional SetCanaryScale setCanaryScale = 5;
+
+  // SetHeaderRoute defines the route with specified header name to send 100% of traffic to the canary service
+  // +optional
+  optional SetHeaderRoute setHeaderRoute = 6;
+
+  // SetMirrorRoutes Mirrors traffic that matches rules to a particular destination
+  // +optional
+  optional SetMirrorRoute setMirrorRoute = 8;
 }
 
 // CanaryStrategy defines parameters for a Replica Based Canary
@@ -423,6 +499,9 @@ message CanaryStrategy {
   // scaling down the stable as traffic is increased to canary. When disabled (the default behavior)
   // the stable ReplicaSet remains fully scaled to support instantaneous aborts.
   optional bool dynamicStableScale = 14;
+
+  // PingPongSpec holds the ping and pong services
+  optional PingPongSpec pingPong = 15;
 }
 
 // CloudWatchMetric defines the cloudwatch query to perform canary analysis
@@ -495,6 +574,13 @@ message DatadogMetric {
   optional string interval = 1;
 
   optional string query = 2;
+}
+
+// DryRun defines the settings for running the analysis in Dry-Run mode.
+message DryRun {
+  // Name of the metric which needs to be evaluated in the Dry-Run mode. Wildcard '*' is supported and denotes all
+  // the available metrics.
+  optional string metricName = 1;
 }
 
 // Experiment is a specification for an Experiment resource
@@ -609,6 +695,18 @@ message ExperimentSpec {
   // more information
   // +optional
   optional int32 scaleDownDelaySeconds = 6;
+
+  // DryRun object contains the settings for running the analysis in Dry-Run mode
+  // +patchMergeKey=metricName
+  // +patchStrategy=merge
+  // +optional
+  repeated DryRun dryRun = 7;
+
+  // MeasurementRetention object contains the settings for retaining the number of measurements during the analysis
+  // +patchMergeKey=metricName
+  // +patchStrategy=merge
+  // +optional
+  repeated MeasurementRetention measurementRetention = 8;
 }
 
 // ExperimentStatus is the status for a Experiment resource
@@ -650,6 +748,23 @@ message GraphiteMetric {
   optional string address = 1;
 
   // Query is a raw Graphite query to perform
+  optional string query = 2;
+}
+
+message HeaderRoutingMatch {
+  // HeaderName the name of the request header
+  optional string headerName = 1;
+
+  // HeaderValue the value of the header
+  optional StringMatch headerValue = 2;
+}
+
+// InfluxdbMetric defines the InfluxDB Flux query to perform canary analysis
+message InfluxdbMetric {
+  // Profile is the name of the secret holding InfluxDB account configuration
+  optional string profile = 1;
+
+  // Query is a raw InfluxDB flux query to perform
   optional string query = 2;
 }
 
@@ -728,6 +843,10 @@ message KayentaThreshold {
   optional int64 marginal = 2;
 }
 
+message MangedRoutes {
+  optional string name = 1;
+}
+
 // Measurement is a point in time result value of a single metric, and the time it was measured
 message Measurement {
   // Phase is the status of this single measurement
@@ -751,6 +870,15 @@ message Measurement {
 
   // ResumeAt is the  timestamp when the analysisRun should try to resume the measurement
   optional k8s.io.apimachinery.pkg.apis.meta.v1.Time resumeAt = 7;
+}
+
+// MeasurementRetention defines the settings for retaining the number of measurements during the analysis.
+message MeasurementRetention {
+  // MetricName is the name of the metric on which this retention policy should be applied.
+  optional string metricName = 1;
+
+  // Limit is the maximum number of measurements to be retained for this given metric.
+  optional int32 limit = 2;
 }
 
 // Metric defines a metric in which to perform analysis
@@ -828,6 +956,9 @@ message MetricProvider {
 
   // Graphite specifies the Graphite metric to query
   optional GraphiteMetric graphite = 9;
+
+  // Influxdb specifies the influxdb metric to query
+  optional InfluxdbMetric influxdb = 10;
 }
 
 // MetricResult contain a list of the most recent measurements for a single metric along with
@@ -864,6 +995,14 @@ message MetricResult {
   // ConsecutiveError is the number of times an error was encountered during measurement in succession
   // Resets to zero when non-errors are encountered
   optional int32 consecutiveError = 10;
+
+  // DryRun indicates whether this metric is running in a dry-run mode or not
+  optional bool dryRun = 11;
+
+  // Metadata stores additional metadata about this metric. It is used by different providers to store
+  // the final state which gets used while taking measurements. For example, Prometheus uses this field
+  // to store the final resolved query after substituting the template arguments.
+  map<string, string> metadata = 12;
 }
 
 // NewRelicMetric defines the newrelic query to perform canary analysis
@@ -905,6 +1044,15 @@ message PauseCondition {
   optional string reason = 1;
 
   optional k8s.io.apimachinery.pkg.apis.meta.v1.Time startTime = 2;
+}
+
+// PingPongSpec holds the ping and pong service name.
+message PingPongSpec {
+  // name of the ping service
+  optional string pingService = 1;
+
+  // name of the pong service
+  optional string pongService = 2;
 }
 
 // PodTemplateMetadata extra labels to add to the template
@@ -955,6 +1103,18 @@ message RolloutAnalysis {
   // +patchMergeKey=name
   // +patchStrategy=merge
   repeated AnalysisRunArgument args = 2;
+
+  // DryRun object contains the settings for running the analysis in Dry-Run mode
+  // +patchMergeKey=metricName
+  // +patchStrategy=merge
+  // +optional
+  repeated DryRun dryRun = 3;
+
+  // MeasurementRetention object contains the settings for retaining the number of measurements during the analysis
+  // +patchMergeKey=metricName
+  // +patchStrategy=merge
+  // +optional
+  repeated MeasurementRetention measurementRetention = 4;
 }
 
 // RolloutAnalysisBackground defines a template that is used to create a background analysisRun
@@ -1127,7 +1287,7 @@ message RolloutSpec {
   optional int32 progressDeadlineSeconds = 8;
 
   // ProgressDeadlineAbort is whether to abort the update when ProgressDeadlineSeconds
-  // is exceeded if analysis is not used. Default is false.
+  // is exceeded.
   // +optional
   optional bool progressDeadlineAbort = 12;
 
@@ -1143,7 +1303,11 @@ message RolloutStatus {
   // Abort cancel the current rollout progression
   optional bool abort = 1;
 
-  // PauseConditions indicates why the rollout is currently paused
+  // PauseConditions is a list of reasons why rollout became automatically paused (e.g.
+  // CanaryPauseStep, BlueGreenPause, InconclusiveAnalysis). The items in this list are populated
+  // by the controller but are cleared by the user (e.g. plugin, argo-cd resume action) when they
+  // wish to unpause. If pause conditions is empty, but controllerPause is true, it indicates
+  // the user manually unpaused the Rollout
   repeated PauseCondition pauseConditions = 2;
 
   // ControllerPause indicates the controller has paused the rollout. It is set to true when
@@ -1268,6 +1432,48 @@ message RolloutTrafficRouting {
 
   // Ambassador holds specific configuration to use Ambassador to route traffic
   optional AmbassadorTrafficRouting ambassador = 5;
+
+  // AppMesh holds specific configuration to use AppMesh to route traffic
+  optional AppMeshTrafficRouting appMesh = 6;
+
+  // Traefik holds specific configuration to use Traefik to route traffic
+  optional TraefikTrafficRouting traefik = 7;
+
+  // A list of HTTP routes that Argo Rollouts manages, the order of this array also becomes the precedence in the upstream
+  // traffic router.
+  repeated MangedRoutes managedRoutes = 8;
+}
+
+message RouteMatch {
+  // Method What http methods should be mirrored
+  // +optional
+  optional StringMatch method = 1;
+
+  // Path What url paths should be mirrored
+  // +optional
+  optional StringMatch path = 2;
+
+  // Headers What request with matching headers should be mirrored
+  // +optional
+  map<string, StringMatch> headers = 3;
+}
+
+// RunSummary contains the final results from the metric executions
+message RunSummary {
+  // This is equal to the sum of Successful, Failed, Inconclusive
+  optional int32 count = 1;
+
+  // Successful is the number of times the metric was measured Successful
+  optional int32 successful = 2;
+
+  // Failed is the number of times the metric was measured Failed
+  optional int32 failed = 3;
+
+  // Inconclusive is the number of times the metric was measured Inconclusive
+  optional int32 inconclusive = 4;
+
+  // Error is the number of times an error was encountered during measurement
+  optional int32 error = 5;
 }
 
 // SMITrafficRouting configuration for TrafficSplit Custom Resource to control traffic routing
@@ -1316,10 +1522,46 @@ message SetCanaryScale {
   optional bool matchTrafficWeight = 3;
 }
 
+// SetHeaderRoute defines the route with specified header name to send 100% of traffic to the canary service
+message SetHeaderRoute {
+  // Name this is the name of the route to use for the mirroring of traffic this also needs
+  // to be included in the `spec.strategy.canary.trafficRouting.managedRoutes` field
+  optional string name = 1;
+
+  repeated HeaderRoutingMatch match = 2;
+}
+
+message SetMirrorRoute {
+  // Name this is the name of the route to use for the mirroring of traffic this also needs
+  // to be included in the `spec.strategy.canary.trafficRouting.managedRoutes` field
+  optional string name = 1;
+
+  // Match Contains a list of rules that if mated will mirror the traffic to the services
+  // +optional
+  repeated RouteMatch match = 2;
+
+  // Services The list of services to mirror the traffic to if the method, path, headers match
+  // Service string `json:"service" protobuf:"bytes,3,opt,name=service"`
+  // Percentage What percent of the traffic that matched the rules should be mirrored
+  optional int32 percentage = 4;
+}
+
 message StickinessConfig {
   optional bool enabled = 1;
 
   optional int64 durationSeconds = 2;
+}
+
+// StringMatch Used to define what type of matching we will use exact, prefix, or regular expression
+message StringMatch {
+  // Exact The string must match exactly
+  optional string exact = 1;
+
+  // Prefix The string will be prefixed matched
+  optional string prefix = 2;
+
+  // Regex The string will be regular expression matched
+  optional string regex = 3;
 }
 
 // TLSRoute holds the information on the virtual service's TLS/HTTPS routes that are desired to be matched for changing weights.
@@ -1399,6 +1641,12 @@ message TemplateStatus {
 
   // PodTemplateHash is the value of the Replicas' PodTemplateHash
   optional string podTemplateHash = 11;
+}
+
+// TraefikTrafficRouting defines the configuration required to use Traefik as traffic router
+message TraefikTrafficRouting {
+  // TraefikServiceName refer to the name of the Traefik service used to route traffic to the service
+  optional string weightedTraefikServiceName = 1;
 }
 
 // TrafficWeights describes the current status of how traffic has been split

@@ -1,3 +1,4 @@
+//go:build e2e
 // +build e2e
 
 package e2e
@@ -111,6 +112,9 @@ spec:
           requests:
             memory: 16Mi
             cpu: 1m
+      volumes:
+      - name: cache-volume
+        emptyDir: {}
 `).
 		When().
 		ApplyManifests().

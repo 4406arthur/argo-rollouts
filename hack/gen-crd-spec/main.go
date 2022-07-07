@@ -14,9 +14,10 @@ import (
 
 	"github.com/blang/semver"
 	"github.com/ghodss/yaml"
-	"github.com/go-openapi/spec"
 	extensionsobj "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	kubeopenapiutil "k8s.io/kube-openapi/pkg/util"
+	spec "k8s.io/kube-openapi/pkg/validation/spec"
 )
 
 const metadataValidation = `properties:
@@ -79,12 +80,6 @@ func NewCustomResourceDefinition() []*extensionsobj.CustomResourceDefinition {
 	crdYamlBytes, err := exec.Command(
 		"controller-gen",
 		"paths=./pkg/apis/rollouts/...",
-		"crd:trivialVersions=true",
-		// The only possible value is 'false' since 'apiextensions.k8s.io/v1'
-		// https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#field-pruning
-		// It is possible though to opt-out of pruning for specifc sub-trees of fields by adding x-kubernetes-preserve-unknown-fields: true
-		// by using the 'setValidationOverride' function in this file.
-		"crd:preserveUnknownFields=false",
 		"crd:crdVersions=v1",
 		"crd:maxDescLen=0",
 		"output:crd:stdout",
@@ -244,7 +239,7 @@ func removeK8S118Fields(un *unstructured.Unstructured) {
 		setValidationOverride(un, preserveUnknownFields, "spec.template.spec.ephemeralContainers[].resources.requests")
 		// Replace this with "spec.template.spec.volumes[].ephemeral.volumeClaimTemplate.spec.resources.{limits/requests}"
 		// when it's ok to only support k8s 1.17+
-		setValidationOverride(un, preserveUnknownFields, "spec.template.spec.volumes")
+		setValidationOverride(un, preserveUnknownFields, "spec.template.spec.volumes[]")
 	case "Experiment":
 		setValidationOverride(un, preserveUnknownFields, "spec.templates[].template.spec.containers[].resources.limits")
 		setValidationOverride(un, preserveUnknownFields, "spec.templates[].template.spec.containers[].resources.requests")
@@ -404,9 +399,6 @@ func generateKustomizeSchema(crds []*extensionsobj.CustomResourceDefinition, out
 
 	definitions := map[string]interface{}{}
 	for _, crd := range crds {
-		if crd.Spec.Names.Kind != "Rollout" {
-			continue
-		}
 		var version string
 		var props map[string]extensionsobj.JSONSchemaProps
 		for _, v := range crd.Spec.Versions {
@@ -440,7 +432,8 @@ func generateKustomizeSchema(crds []*extensionsobj.CustomResourceDefinition, out
 			}
 		}
 
-		definitions[fmt.Sprintf("%s.%s", version, crd.Spec.Names.Kind)] = map[string]interface{}{
+		definitionName := kubeopenapiutil.ToRESTFriendlyName(fmt.Sprintf("%s/%s.%s", crd.Spec.Group, version, crd.Spec.Names.Kind))
+		definitions[definitionName] = map[string]interface{}{
 			"properties": propsMap,
 			"x-kubernetes-group-version-kind": []map[string]string{{
 				"group":   crd.Spec.Group,

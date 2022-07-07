@@ -304,6 +304,54 @@ NAME                                     KIND        STATUS              AGE  IN
 	assertStdout(t, expectedOut, o.IOStreams)
 }
 
+func TestGetCanaryPingPongRollout(t *testing.T) {
+	rolloutObjs := testdata.NewCanaryRollout()
+
+	tf, o := options.NewFakeArgoRolloutsOptions(rolloutObjs.AllObjects()...)
+	o.RESTClientGetter = tf.WithNamespace(rolloutObjs.Rollouts[3].Namespace)
+	defer tf.Cleanup()
+	cmd := NewCmdGetRollout(o)
+	cmd.PersistentPreRunE = o.PersistentPreRunE
+	cmd.SetArgs([]string{rolloutObjs.Rollouts[3].Name, "--no-color"})
+	err := cmd.Execute()
+	assert.NoError(t, err)
+
+	expectedOut := strings.TrimPrefix(`
+Name:            canary-demo-pingpong
+Namespace:       jesse-test
+Status:          ✖ Degraded
+Message:         ProgressDeadlineExceeded: ReplicaSet "canary-demo-65fb5ffc84" has timed out progressing.
+Strategy:        Canary
+  Step:          0/8
+  SetWeight:     20
+  ActualWeight:  0
+Images:          argoproj/rollouts-demo:does-not-exist (canary, ping)
+                 argoproj/rollouts-demo:green (stable, pong)
+Replicas:
+  Desired:       5
+  Current:       6
+  Updated:       1
+  Ready:         5
+  Available:     5
+
+NAME                                     KIND        STATUS              AGE  INFO
+⟳ canary-demo-pingpong                   Rollout     ✖ Degraded          7d
+├──# revision:31
+│  └──⧉ canary-demo-65fb5ffc84           ReplicaSet  ◌ Progressing       7d   canary,ping
+│     └──□ canary-demo-65fb5ffc84-9wf5r  Pod         ⚠ ImagePullBackOff  7d   ready:0/1
+├──# revision:30
+│  └──⧉ canary-demo-877894d5b            ReplicaSet  ✔ Healthy           7d   stable,pong
+│     ├──□ canary-demo-877894d5b-6jfpt   Pod         ✔ Running           7d   ready:1/1
+│     ├──□ canary-demo-877894d5b-7jmqw   Pod         ✔ Running           7d   ready:1/1
+│     ├──□ canary-demo-877894d5b-j8g2b   Pod         ✔ Running           7d   ready:1/1
+│     ├──□ canary-demo-877894d5b-jw5qm   Pod         ✔ Running           7d   ready:1/1
+│     └──□ canary-demo-877894d5b-kh7x4   Pod         ✔ Running           7d   ready:1/1
+└──# revision:29
+   └──⧉ canary-demo-859c99b45c           ReplicaSet  • ScaledDown        7d
+`, "\n")
+	assertStdout(t, expectedOut, o.IOStreams)
+}
+
 func TestExperimentRollout(t *testing.T) {
 	rolloutObjs := testdata.NewExperimentAnalysisRollout()
 
@@ -345,6 +393,13 @@ NAME                                                                           K
 │  │  └──⧉ rollout-experiment-analysis-6f646bf7b7-1-vcv27-canary-7699dcf5d     ReplicaSet   ✔ Healthy       7d
 │  │     └──□ rollout-experiment-analysis-6f646bf7b7-1-vcv27-canary-7699vgr24  Pod          ✔ Running       7d   ready:1/1
 │  └──α rollout-experiment-analysis-random-fail-6f646bf7b7-skqcr               AnalysisRun  ? Inconclusive  7d   ✔ 4,✖ 4,? 1,⚠ 1
+│     ├──⊞ rollout-experiment-analysis-random-fail-6f646bf7b7-skqcr-rzl6lt     Job          ✖ Failed        7d
+│     ├──⊞ rollout-experiment-analysis-random-fail-6f646bf7b7-skqcr-r8lqpd     Job          ✔ Successful    7d
+│     ├──⊞ rollout-experiment-analysis-random-fail-6f646bf7b7-skqcr-rjjsgg     Job          ✔ Successful    7d
+│     ├──⊞ rollout-experiment-analysis-random-fail-6f646bf7b7-skqcr-rrnfj5     Job          ✖ Failed        7d
+│     ├──⊞ rollout-experiment-analysis-random-fail-6f646bf7b7-skqcr-rx5kqk     Job          ✖ Failed        7d
+│     ├──⊞ rollout-experiment-analysis-random-fail-6f646bf7b7-skqcr-rp894b     Job          ✔ Successful    7d
+│     ├──⊞ rollout-experiment-analysis-random-fail-6f646bf7b7-skqcr-rmngtj     Job          ✖ Failed        7d
 │     └──⊞ rollout-experiment-analysis-random-fail-6f646bf7b7-skqcr-rsxm69     Job          ✔ Successful    7d
 └──# revision:1
    └──⧉ rollout-experiment-analysis-f6db98dff                                  ReplicaSet   ✔ Healthy       7d   stable

@@ -3,6 +3,8 @@ package metricproviders
 import (
 	"fmt"
 
+	"github.com/argoproj/argo-rollouts/metricproviders/influxdb"
+
 	"github.com/argoproj/argo-rollouts/metricproviders/cloudwatch"
 	"github.com/argoproj/argo-rollouts/metricproviders/datadog"
 	"github.com/argoproj/argo-rollouts/metricproviders/graphite"
@@ -34,6 +36,9 @@ type Provider interface {
 	GarbageCollect(*v1alpha1.AnalysisRun, v1alpha1.Metric, int) error
 	// Type gets the provider type
 	Type() string
+	// GetMetadata returns any additional metadata which providers need to store/display as part
+	// of the metric result. For example, Prometheus uses is to store the final resolved queries.
+	GetMetadata(metric v1alpha1.Metric) map[string]string
 }
 
 type ProviderFactory struct {
@@ -85,11 +90,17 @@ func (f *ProviderFactory) NewProvider(logCtx log.Entry, metric v1alpha1.Metric) 
 		}
 		return graphite.NewGraphiteProvider(client, logCtx), nil
 	case cloudwatch.ProviderType:
-		clinet, err := cloudwatch.NewCloudWatchAPIClient(metric)
+		client, err := cloudwatch.NewCloudWatchAPIClient(metric)
 		if err != nil {
 			return nil, err
 		}
-		return cloudwatch.NewCloudWatchProvider(clinet, logCtx), nil
+		return cloudwatch.NewCloudWatchProvider(client, logCtx), nil
+	case influxdb.ProviderType:
+		client, err := influxdb.NewInfluxdbAPI(metric, f.KubeClient)
+		if err != nil {
+			return nil, err
+		}
+		return influxdb.NewInfluxdbProvider(client, logCtx), nil
 	default:
 		return nil, fmt.Errorf("no valid provider in metric '%s'", metric.Name)
 	}
@@ -112,6 +123,11 @@ func Type(metric v1alpha1.Metric) string {
 		return newrelic.ProviderType
 	} else if metric.Provider.CloudWatch != nil {
 		return cloudwatch.ProviderType
+	} else if metric.Provider.Graphite != nil {
+		return graphite.ProviderType
+	} else if metric.Provider.Influxdb != nil {
+		return influxdb.ProviderType
 	}
+
 	return "Unknown Provider"
 }

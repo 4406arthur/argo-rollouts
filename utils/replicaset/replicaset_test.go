@@ -23,6 +23,7 @@ import (
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/utils/annotations"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
+	"github.com/argoproj/argo-rollouts/utils/hash"
 	timeutil "github.com/argoproj/argo-rollouts/utils/time"
 )
 
@@ -60,14 +61,14 @@ func generateRollout(image string) v1alpha1.Rollout {
 // generateRS creates a replica set, with the input rollout's template as its template
 func generateRS(rollout v1alpha1.Rollout) appsv1.ReplicaSet {
 	template := rollout.Spec.Template.DeepCopy()
-	podTemplateHash := controller.ComputeHash(&rollout.Spec.Template, nil)
+	podTemplateHash := hash.ComputePodTemplateHash(&rollout.Spec.Template, nil)
 	template.Labels = map[string]string{
 		v1alpha1.DefaultRolloutUniqueLabelKey: podTemplateHash,
 	}
 	return appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{
 			UID:    uuid.NewUUID(),
-			Name:   fmt.Sprintf("%s-%s", rollout.Name, controller.ComputeHash(&rollout.Spec.Template, nil)),
+			Name:   fmt.Sprintf("%s-%s", rollout.Name, podTemplateHash),
 			Labels: template.Labels,
 		},
 		Spec: appsv1.ReplicaSetSpec{
@@ -78,6 +79,26 @@ func generateRS(rollout v1alpha1.Rollout) appsv1.ReplicaSet {
 	}
 }
 
+func TestFindNewReplicaSet(t *testing.T) {
+	ro := generateRollout("red")
+	rs1 := generateRS(ro)
+	rs1.Labels["name"] = "red"
+	*(rs1.Spec.Replicas) = 1
+
+	t.Run("FindNewReplicaSet by hash", func(t *testing.T) {
+		// rs has the current hash
+		rs1.Labels[v1alpha1.DefaultRolloutUniqueLabelKey] = hash.ComputePodTemplateHash(&ro.Spec.Template, ro.Status.CollisionCount)
+		actual := FindNewReplicaSet(&ro, []*appsv1.ReplicaSet{&rs1})
+		assert.Equal(t, &rs1, actual)
+	})
+	t.Run("FindNewReplicaSet by deprecated hash", func(t *testing.T) {
+		// rs has the deprecated hash
+		rs1.Labels[v1alpha1.DefaultRolloutUniqueLabelKey] = controller.ComputeHash(&ro.Spec.Template, ro.Status.CollisionCount)
+		actual := FindNewReplicaSet(&ro, []*appsv1.ReplicaSet{&rs1})
+		assert.Equal(t, &rs1, actual)
+	})
+}
+
 func TestFindOldReplicaSets(t *testing.T) {
 	now := metav1.Now()
 	before := metav1.Time{Time: now.Add(-time.Minute)}
@@ -85,7 +106,7 @@ func TestFindOldReplicaSets(t *testing.T) {
 	rollout := generateRollout("nginx")
 	newRS := generateRS(rollout)
 	*(newRS.Spec.Replicas) = 1
-	newRS.Labels[v1alpha1.DefaultRolloutUniqueLabelKey] = "hash"
+	newRS.Labels[v1alpha1.DefaultRolloutUniqueLabelKey] = hash.ComputePodTemplateHash(&rollout.Spec.Template, rollout.Status.CollisionCount)
 	newRS.CreationTimestamp = now
 
 	oldRollout := generateRollout("nginx")
@@ -122,7 +143,7 @@ func TestFindOldReplicaSets(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
-			allRS := FindOldReplicaSets(&test.rollout, test.rsList)
+			allRS := FindOldReplicaSets(&test.rollout, test.rsList, &newRS)
 			sort.Sort(controller.ReplicaSetsByCreationTimestamp(allRS))
 			sort.Sort(controller.ReplicaSetsByCreationTimestamp(test.expected))
 			if !reflect.DeepEqual(allRS, test.expected) {
@@ -637,7 +658,7 @@ func TestCheckPodSpecChange(t *testing.T) {
 	ro := generateRollout("nginx")
 	rs := generateRS(ro)
 	assert.False(t, CheckPodSpecChange(&ro, &rs))
-	ro.Status.CurrentPodHash = controller.ComputeHash(&ro.Spec.Template, ro.Status.CollisionCount)
+	ro.Status.CurrentPodHash = hash.ComputePodTemplateHash(&ro.Spec.Template, ro.Status.CollisionCount)
 	assert.False(t, CheckPodSpecChange(&ro, &rs))
 
 	ro.Status.CurrentPodHash = "different-hash"
@@ -828,7 +849,7 @@ func TestGenerateReplicaSetAffinity(t *testing.T) {
 	assert.Equal(t, "", ro.Status.StableRS)
 	assert.Nil(t, GenerateReplicaSetAffinity(ro))
 	// StableRS is equal to CurrentPodHash
-	ro.Status.StableRS = controller.ComputeHash(&ro.Spec.Template, nil)
+	ro.Status.StableRS = hash.ComputePodTemplateHash(&ro.Spec.Template, nil)
 	assert.Nil(t, GenerateReplicaSetAffinity(ro))
 
 	// Injects anti-affinity rule with RequiredDuringSchedulingIgnoredDuringExecution into empty RS Affinity object
@@ -1249,9 +1270,9 @@ spec:
 	assert.True(t, PodTemplateEqualIgnoreHash(&live, &desired))
 }
 
-func TestIsReplicaSetReady(t *testing.T) {
+func TestIsReplicaSetAvailable(t *testing.T) {
 	{
-		assert.False(t, IsReplicaSetReady(nil))
+		assert.False(t, IsReplicaSetAvailable(nil))
 	}
 	{
 		rs := appsv1.ReplicaSet{
@@ -1259,10 +1280,11 @@ func TestIsReplicaSetReady(t *testing.T) {
 				Replicas: pointer.Int32Ptr(1),
 			},
 			Status: appsv1.ReplicaSetStatus{
-				ReadyReplicas: 0,
+				ReadyReplicas:     0,
+				AvailableReplicas: 0,
 			},
 		}
-		assert.False(t, IsReplicaSetReady(&rs))
+		assert.False(t, IsReplicaSetAvailable(&rs))
 	}
 	{
 		rs := appsv1.ReplicaSet{
@@ -1270,10 +1292,11 @@ func TestIsReplicaSetReady(t *testing.T) {
 				Replicas: pointer.Int32Ptr(1),
 			},
 			Status: appsv1.ReplicaSetStatus{
-				ReadyReplicas: 1,
+				ReadyReplicas:     1,
+				AvailableReplicas: 1,
 			},
 		}
-		assert.True(t, IsReplicaSetReady(&rs))
+		assert.True(t, IsReplicaSetAvailable(&rs))
 	}
 	{
 		rs := appsv1.ReplicaSet{
@@ -1281,10 +1304,11 @@ func TestIsReplicaSetReady(t *testing.T) {
 				Replicas: pointer.Int32Ptr(1),
 			},
 			Status: appsv1.ReplicaSetStatus{
-				ReadyReplicas: 2,
+				ReadyReplicas:     2,
+				AvailableReplicas: 2,
 			},
 		}
-		assert.True(t, IsReplicaSetReady(&rs))
+		assert.True(t, IsReplicaSetAvailable(&rs))
 	}
 	{
 		rs := appsv1.ReplicaSet{
@@ -1292,10 +1316,23 @@ func TestIsReplicaSetReady(t *testing.T) {
 				Replicas: pointer.Int32Ptr(0),
 			},
 			Status: appsv1.ReplicaSetStatus{
-				ReadyReplicas: 0,
+				ReadyReplicas:     0,
+				AvailableReplicas: 0,
 			},
 		}
-		// NOTE: currently consider scaled down replicas as not ready
-		assert.False(t, IsReplicaSetReady(&rs))
+		// NOTE: currently consider scaled down replicas as not available
+		assert.False(t, IsReplicaSetAvailable(&rs))
+	}
+	{
+		rs := appsv1.ReplicaSet{
+			Spec: appsv1.ReplicaSetSpec{
+				Replicas: pointer.Int32Ptr(0),
+			},
+			Status: appsv1.ReplicaSetStatus{
+				ReadyReplicas:     1,
+				AvailableReplicas: 0,
+			},
+		}
+		assert.False(t, IsReplicaSetAvailable(&rs))
 	}
 }

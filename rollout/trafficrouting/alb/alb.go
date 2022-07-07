@@ -13,6 +13,7 @@ import (
 	"k8s.io/utils/pointer"
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
+	"github.com/argoproj/argo-rollouts/rollout/trafficrouting"
 	"github.com/argoproj/argo-rollouts/utils/aws"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
 	"github.com/argoproj/argo-rollouts/utils/defaults"
@@ -112,6 +113,10 @@ func (r *Reconciler) SetWeight(desiredWeight int32, additionalDestinations ...v1
 	return nil
 }
 
+func (r *Reconciler) SetHeaderRoute(headerRouting *v1alpha1.SetHeaderRoute) error {
+	return nil
+}
+
 func (r *Reconciler) shouldVerifyWeight() bool {
 	if r.cfg.VerifyWeight != nil {
 		return *r.cfg.VerifyWeight
@@ -121,7 +126,11 @@ func (r *Reconciler) shouldVerifyWeight() bool {
 
 func (r *Reconciler) VerifyWeight(desiredWeight int32, additionalDestinations ...v1alpha1.WeightDestination) (*bool, error) {
 	if !r.shouldVerifyWeight() {
+		r.cfg.Status.ALB = nil
 		return nil, nil
+	}
+	if r.cfg.Status.ALB == nil {
+		r.cfg.Status.ALB = &v1alpha1.ALBStatus{}
 	}
 	ctx := context.TODO()
 	rollout := r.cfg.Rollout
@@ -132,9 +141,8 @@ func (r *Reconciler) VerifyWeight(desiredWeight int32, additionalDestinations ..
 	}
 	resourceIDToDest := map[string]v1alpha1.WeightDestination{}
 
-	canaryService := rollout.Spec.Strategy.Canary.CanaryService
+	stableService, canaryService := trafficrouting.GetStableAndCanaryServices(rollout)
 	canaryResourceID := aws.BuildTargetGroupResourceID(rollout.Namespace, ingress.GetName(), canaryService, rollout.Spec.Strategy.Canary.TrafficRouting.ALB.ServicePort)
-	stableService := rollout.Spec.Strategy.Canary.StableService
 	stableResourceID := aws.BuildTargetGroupResourceID(rollout.Namespace, ingress.GetName(), stableService, rollout.Spec.Strategy.Canary.TrafficRouting.ALB.ServicePort)
 
 	for _, dest := range additionalDestinations {
@@ -158,7 +166,7 @@ func (r *Reconciler) VerifyWeight(desiredWeight int32, additionalDestinations ..
 			return pointer.BoolPtr(false), err
 		}
 		if lb == nil || lb.LoadBalancerArn == nil {
-			r.log.Infof("LoadBalancer %s not found", lbIngress.Hostname)
+			r.cfg.Recorder.Warnf(rollout, record.EventOptions{EventReason: conditions.LoadBalancerNotFoundReason}, conditions.LoadBalancerNotFoundMessage, lbIngress.Hostname)
 			return pointer.BoolPtr(false), nil
 		}
 
@@ -208,8 +216,7 @@ func (r *Reconciler) VerifyWeight(desiredWeight int32, additionalDestinations ..
 }
 
 func getForwardActionString(r *v1alpha1.Rollout, port int32, desiredWeight int32, additionalDestinations ...v1alpha1.WeightDestination) (string, error) {
-	stableService := r.Spec.Strategy.Canary.StableService
-	canaryService := r.Spec.Strategy.Canary.CanaryService
+	stableService, canaryService := trafficrouting.GetStableAndCanaryServices(r)
 	portStr := strconv.Itoa(int(port))
 	stableWeight := int32(100)
 	targetGroups := make([]ingressutil.ALBTargetGroup, 0)
@@ -283,5 +290,13 @@ func getDesiredAnnotations(current *ingressutil.Ingress, r *v1alpha1.Rollout, po
 
 // UpdateHash informs a traffic routing reconciler about new canary/stable pod hashes
 func (r *Reconciler) UpdateHash(canaryHash, stableHash string, additionalDestinations ...v1alpha1.WeightDestination) error {
+	return nil
+}
+
+func (r *Reconciler) SetMirrorRoute(setMirrorRoute *v1alpha1.SetMirrorRoute) error {
+	return nil
+}
+
+func (r *Reconciler) RemoveManagedRoutes() error {
 	return nil
 }

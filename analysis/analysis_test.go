@@ -892,6 +892,7 @@ func TestReconcileAnalysisRunInitial(t *testing.T) {
 		},
 	}
 	f.provider.On("Run", mock.Anything, mock.Anything, mock.Anything).Return(newMeasurement(v1alpha1.AnalysisPhaseSuccessful), nil)
+	f.provider.On("GetMetadata", mock.Anything, mock.Anything).Return(map[string]string{}, nil)
 	{
 		newRun := c.reconcileAnalysisRun(run)
 		assert.Equal(t, v1alpha1.AnalysisPhaseRunning, newRun.Status.MetricResults[0].Phase)
@@ -1055,7 +1056,8 @@ func TestTrimMeasurementHistory(t *testing.T) {
 
 	{
 		run := newRun()
-		c.garbageCollectMeasurements(run, 2)
+		err := c.garbageCollectMeasurements(run, map[string]*v1alpha1.MeasurementRetention{}, 2)
+		assert.Nil(t, err)
 		assert.Len(t, run.Status.MetricResults[0].Measurements, 1)
 		assert.Equal(t, "1", run.Status.MetricResults[0].Measurements[0].Value)
 		assert.Len(t, run.Status.MetricResults[1].Measurements, 2)
@@ -1064,11 +1066,36 @@ func TestTrimMeasurementHistory(t *testing.T) {
 	}
 	{
 		run := newRun()
-		c.garbageCollectMeasurements(run, 1)
+		err := c.garbageCollectMeasurements(run, map[string]*v1alpha1.MeasurementRetention{}, 1)
+		assert.Nil(t, err)
 		assert.Len(t, run.Status.MetricResults[0].Measurements, 1)
 		assert.Equal(t, "1", run.Status.MetricResults[0].Measurements[0].Value)
 		assert.Len(t, run.Status.MetricResults[1].Measurements, 1)
 		assert.Equal(t, "3", run.Status.MetricResults[1].Measurements[0].Value)
+	}
+	{
+		run := newRun()
+		var measurementRetentionMetricsMap = map[string]*v1alpha1.MeasurementRetention{}
+		measurementRetentionMetricsMap["metric2"] = &v1alpha1.MeasurementRetention{MetricName: "*", Limit: 2}
+		err := c.garbageCollectMeasurements(run, measurementRetentionMetricsMap, 1)
+		assert.Nil(t, err)
+		assert.Len(t, run.Status.MetricResults[0].Measurements, 1)
+		assert.Equal(t, "1", run.Status.MetricResults[0].Measurements[0].Value)
+		assert.Len(t, run.Status.MetricResults[1].Measurements, 2)
+		assert.Equal(t, "2", run.Status.MetricResults[1].Measurements[0].Value)
+		assert.Equal(t, "3", run.Status.MetricResults[1].Measurements[1].Value)
+	}
+	{
+		run := newRun()
+		var measurementRetentionMetricsMap = map[string]*v1alpha1.MeasurementRetention{}
+		measurementRetentionMetricsMap["metric2"] = &v1alpha1.MeasurementRetention{MetricName: "metric2", Limit: 2}
+		err := c.garbageCollectMeasurements(run, measurementRetentionMetricsMap, 1)
+		assert.Nil(t, err)
+		assert.Len(t, run.Status.MetricResults[0].Measurements, 1)
+		assert.Equal(t, "1", run.Status.MetricResults[0].Measurements[0].Value)
+		assert.Len(t, run.Status.MetricResults[1].Measurements, 2)
+		assert.Equal(t, "2", run.Status.MetricResults[1].Measurements[0].Value)
+		assert.Equal(t, "3", run.Status.MetricResults[1].Measurements[1].Value)
 	}
 }
 
@@ -1100,6 +1127,38 @@ func TestResolveMetricArgsUnableToSubstitute(t *testing.T) {
 		assert.Equal(t, v1alpha1.AnalysisPhaseError, newRun.Status.Phase)
 		assert.Equal(t, "Unable to resolve metric arguments: failed to resolve {{args.metric-name}}", newRun.Status.Message)
 	}
+}
+
+func TestGetMetadataIsCalled(t *testing.T) {
+	f := newFixture(t)
+	defer f.Close()
+	c, _, _ := f.newController(noResyncPeriodFunc)
+	arg := "success-rate"
+	run := &v1alpha1.AnalysisRun{
+		Spec: v1alpha1.AnalysisRunSpec{
+			Args: []v1alpha1.Argument{
+				{
+					Name:  "metric-name",
+					Value: &arg,
+				},
+			},
+			Metrics: []v1alpha1.Metric{{
+				Name:             "rate",
+				SuccessCondition: "result[0] > 0",
+				Provider: v1alpha1.MetricProvider{
+					Prometheus: &v1alpha1.PrometheusMetric{
+						Query: "{{args.metric-name}}",
+					},
+				},
+			}},
+		},
+	}
+	metricMetadata := map[string]string{"foo": "bar"}
+	f.provider.On("Run", mock.Anything, mock.Anything, mock.Anything).Return(newMeasurement(v1alpha1.AnalysisPhaseSuccessful), nil)
+	f.provider.On("GetMetadata", mock.Anything, mock.Anything).Return(metricMetadata, nil)
+	newRun := c.reconcileAnalysisRun(run)
+	assert.Equal(t, v1alpha1.AnalysisPhaseSuccessful, newRun.Status.Phase)
+	assert.Equal(t, metricMetadata, newRun.Status.MetricResults[0].Metadata)
 }
 
 // TestSecretContentReferenceSuccess verifies that secret arguments are properly resolved
@@ -1146,6 +1205,7 @@ func TestSecretContentReferenceSuccess(t *testing.T) {
 		},
 	}
 	f.provider.On("Run", mock.Anything, mock.Anything, mock.Anything).Return(newMeasurement(v1alpha1.AnalysisPhaseSuccessful), nil)
+	f.provider.On("GetMetadata", mock.Anything, mock.Anything).Return(map[string]string{}, nil)
 	newRun := c.reconcileAnalysisRun(run)
 	assert.Equal(t, v1alpha1.AnalysisPhaseSuccessful, newRun.Status.Phase)
 }
@@ -1210,6 +1270,7 @@ func TestSecretContentReferenceProviderError(t *testing.T) {
 	measurement.Message = error.Error()
 
 	f.provider.On("Run", mock.Anything, mock.Anything, mock.Anything).Return(measurement)
+	f.provider.On("GetMetadata", mock.Anything, mock.Anything).Return(map[string]string{}, nil)
 	newRun := c.reconcileAnalysisRun(run)
 	logMessage := buf.String()
 
@@ -1271,6 +1332,7 @@ func TestSecretContentReferenceAndMultipleArgResolutionSuccess(t *testing.T) {
 	}
 
 	f.provider.On("Run", mock.Anything, mock.Anything, mock.Anything).Return(newMeasurement(v1alpha1.AnalysisPhaseSuccessful), nil)
+	f.provider.On("GetMetadata", mock.Anything, mock.Anything).Return(map[string]string{}, nil)
 	newRun := c.reconcileAnalysisRun(run)
 	assert.Equal(t, v1alpha1.AnalysisPhaseSuccessful, newRun.Status.Phase)
 }
@@ -1674,4 +1736,45 @@ func TestInvalidDryRunConfigThrowsError(t *testing.T) {
 	newRun := c.reconcileAnalysisRun(run)
 	assert.Equal(t, v1alpha1.AnalysisPhaseError, newRun.Status.Phase)
 	assert.Equal(t, "Analysis spec invalid: dryRun[0]: Rule didn't match any metric name(s)", newRun.Status.Message)
+}
+
+func TestInvalidMeasurementsRetentionConfigThrowsError(t *testing.T) {
+	f := newFixture(t)
+	defer f.Close()
+	c, _, _ := f.newController(noResyncPeriodFunc)
+
+	// Mocks terminate to cancel the in-progress measurement
+	f.provider.On("Terminate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(newMeasurement(v1alpha1.AnalysisPhaseSuccessful), nil)
+
+	var measurementsRetentionArray []v1alpha1.MeasurementRetention
+	measurementsRetentionArray = append(measurementsRetentionArray, v1alpha1.MeasurementRetention{MetricName: "error-rate"})
+	now := metav1.Now()
+	run := &v1alpha1.AnalysisRun{
+		Spec: v1alpha1.AnalysisRunSpec{
+			Terminate: true,
+			Args: []v1alpha1.Argument{
+				{
+					Name:  "service",
+					Value: pointer.StringPtr("rollouts-demo-canary.default.svc.cluster.local"),
+				},
+			},
+			Metrics: []v1alpha1.Metric{{
+				Name:             "success-rate",
+				InitialDelay:     "20s",
+				Interval:         "20s",
+				SuccessCondition: "result[0] > 0.90",
+				Provider: v1alpha1.MetricProvider{
+					Web: &v1alpha1.WebMetric{},
+				},
+			}},
+			MeasurementRetention: measurementsRetentionArray,
+		},
+		Status: v1alpha1.AnalysisRunStatus{
+			StartedAt: &now,
+			Phase:     v1alpha1.AnalysisPhaseRunning,
+		},
+	}
+	newRun := c.reconcileAnalysisRun(run)
+	assert.Equal(t, v1alpha1.AnalysisPhaseError, newRun.Status.Phase)
+	assert.Equal(t, "Analysis spec invalid: measurementRetention[0]: Rule didn't match any metric name(s)", newRun.Status.Message)
 }

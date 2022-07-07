@@ -66,6 +66,11 @@ type AnalysisTemplateSpec struct {
 	// +patchStrategy=merge
 	// +optional
 	DryRun []DryRun `json:"dryRun,omitempty" patchStrategy:"merge" patchMergeKey:"metricName" protobuf:"bytes,3,rep,name=dryRun"`
+	// MeasurementRetention object contains the settings for retaining the number of measurements during the analysis
+	// +patchMergeKey=metricName
+	// +patchStrategy=merge
+	// +optional
+	MeasurementRetention []MeasurementRetention `json:"measurementRetention,omitempty" patchStrategy:"merge" patchMergeKey:"metricName" protobuf:"bytes,4,rep,name=measurementRetention"`
 }
 
 // DurationString is a string representing a duration (e.g. 30s, 5m, 1h)
@@ -120,6 +125,14 @@ type DryRun struct {
 	MetricName string `json:"metricName" protobuf:"bytes,1,opt,name=metricName"`
 }
 
+// MeasurementRetention defines the settings for retaining the number of measurements during the analysis.
+type MeasurementRetention struct {
+	// MetricName is the name of the metric on which this retention policy should be applied.
+	MetricName string `json:"metricName" protobuf:"bytes,1,opt,name=metricName"`
+	// Limit is the maximum number of measurements to be retained for this given metric.
+	Limit int32 `json:"limit" protobuf:"varint,2,opt,name=limit"`
+}
+
 // EffectiveCount is the effective count based on whether or not count/interval is specified
 // If neither count or interval is specified, the effective count is 1
 // If only interval is specified, metric runs indefinitely and there is no effective count (nil)
@@ -157,6 +170,8 @@ type MetricProvider struct {
 	CloudWatch *CloudWatchMetric `json:"cloudWatch,omitempty" protobuf:"bytes,8,opt,name=cloudWatch"`
 	// Graphite specifies the Graphite metric to query
 	Graphite *GraphiteMetric `json:"graphite,omitempty" protobuf:"bytes,9,opt,name=graphite"`
+	// Influxdb specifies the influxdb metric to query
+	Influxdb *InfluxdbMetric `json:"influxdb,omitempty" protobuf:"bytes,10,opt,name=influxdb"`
 }
 
 // AnalysisPhase is the overall phase of an AnalysisRun, MetricResult, or Measurement
@@ -216,6 +231,14 @@ type GraphiteMetric struct {
 	// Address is the HTTP address and port of the Graphite server
 	Address string `json:"address,omitempty" protobuf:"bytes,1,opt,name=address"`
 	// Query is a raw Graphite query to perform
+	Query string `json:"query,omitempty" protobuf:"bytes,2,opt,name=query"`
+}
+
+// InfluxdbMetric defines the InfluxDB Flux query to perform canary analysis
+type InfluxdbMetric struct {
+	// Profile is the name of the secret holding InfluxDB account configuration
+	Profile string `json:"profile,omitempty" protobuf:"bytes,1,opt,name=profile"`
+	// Query is a raw InfluxDB flux query to perform
 	Query string `json:"query,omitempty" protobuf:"bytes,2,opt,name=query"`
 }
 
@@ -292,6 +315,11 @@ type AnalysisRunSpec struct {
 	// +patchStrategy=merge
 	// +optional
 	DryRun []DryRun `json:"dryRun,omitempty" patchStrategy:"merge" patchMergeKey:"metricName" protobuf:"bytes,4,rep,name=dryRun"`
+	// MeasurementRetention object contains the settings for retaining the number of measurements during the analysis
+	// +patchMergeKey=metricName
+	// +patchStrategy=merge
+	// +optional
+	MeasurementRetention []MeasurementRetention `json:"measurementRetention,omitempty" patchStrategy:"merge" patchMergeKey:"metricName" protobuf:"bytes,5,rep,name=measurementRetention"`
 }
 
 // Argument is an argument to an AnalysisRun
@@ -380,6 +408,10 @@ type MetricResult struct {
 	ConsecutiveError int32 `json:"consecutiveError,omitempty" protobuf:"varint,10,opt,name=consecutiveError"`
 	// DryRun indicates whether this metric is running in a dry-run mode or not
 	DryRun bool `json:"dryRun,omitempty" protobuf:"varint,11,opt,name=dryRun"`
+	// Metadata stores additional metadata about this metric. It is used by different providers to store
+	// the final state which gets used while taking measurements. For example, Prometheus uses this field
+	// to store the final resolved query after substituting the template arguments.
+	Metadata map[string]string `json:"metadata,omitempty" protobuf:"bytes,12,rep,name=metadata"`
 }
 
 // Measurement is a point in time result value of a single metric, and the time it was measured
