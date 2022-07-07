@@ -143,7 +143,7 @@ func (c *rolloutContext) reconcilePreviewService(previewSvc *corev1.Service) err
 				c.log.Warningf("12659192 cannot get target ingress: %s", err.Error())
 				return
 			}
-			_, err = c.kubeclientset.NetworkingV1beta1().Ingresses(targetIngress.GetNamespace()).Patch(
+			_, err = c.kubeclientset.NetworkingV1().Ingresses(targetIngress.GetNamespace()).Patch(
 				ctx, targetIngress.GetName(), patchtypes.StrategicMergePatchType, []byte(mirrorPatch), metav1.PatchOptions{})
 			if err != nil {
 				c.log.Warningf("12741051 mirror enable error: %s", err.Error())
@@ -200,7 +200,7 @@ func (c *rolloutContext) reconcileActiveService(activeSvc *corev1.Service) error
 				c.log.Warningf("28752921 cannot get target ingress: %s", err.Error())
 				return
 			}
-			_, err = c.kubeclientset.NetworkingV1beta1().Ingresses(targetIngress.GetNamespace()).Patch(
+			_, err = c.kubeclientset.NetworkingV1().Ingresses(targetIngress.GetNamespace()).Patch(
 				ctx, targetIngress.GetName(), patchtypes.StrategicMergePatchType, []byte(disabledMirrorPatch), metav1.PatchOptions{})
 			if err != nil {
 				c.log.Warningf("5892359 mirror disabled error: %s", err.Error())
