@@ -134,16 +134,17 @@ func (c *rolloutContext) reconcilePreviewService(previewSvc *corev1.Service) err
 		msg := fmt.Sprintf("16916212 mirror entry %s", c.rollout.Spec.Strategy.BlueGreen.ActiveService)
 		c.log.Info(msg)
 		mirrorEnable := func() {
+			ctx := context.TODO()
 			c.log.Info("188754781584 god job here")
 			mirrorPatch := fmt.Sprintf(enableMirrirPatch, "http://"+generateServieFQDN(previewSvc)+"$request_uri")
-			targetIngress, err := c.ingressesLister.Ingresses(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.BlueGreen.Ingress)
+			targetIngress, err := c.ingressWrapper.Get(ctx, c.rollout.Namespace, c.rollout.Spec.Strategy.BlueGreen.Ingress, metav1.GetOptions{})
+
 			if err != nil {
 				c.log.Warningf("12659192 cannot get target ingress: %s", err.Error())
 				return
 			}
-			ctx := context.TODO()
-			_, err = c.kubeclientset.NetworkingV1beta1().Ingresses(targetIngress.Namespace).Patch(
-				ctx, targetIngress.Name, patchtypes.StrategicMergePatchType, []byte(mirrorPatch), metav1.PatchOptions{})
+			_, err = c.kubeclientset.NetworkingV1beta1().Ingresses(targetIngress.GetNamespace()).Patch(
+				ctx, targetIngress.GetName(), patchtypes.StrategicMergePatchType, []byte(mirrorPatch), metav1.PatchOptions{})
 			if err != nil {
 				c.log.Warningf("12741051 mirror enable error: %s", err.Error())
 				return
@@ -192,15 +193,15 @@ func (c *rolloutContext) reconcileActiveService(activeSvc *corev1.Service) error
 		msg := fmt.Sprintf("689169411 mirror entry %s", c.rollout.Spec.Strategy.BlueGreen.ActiveService)
 		c.log.Info(msg)
 		mirrorDisabeled := func() {
+			ctx := context.TODO()
 			c.log.Info("8374968212 god job here")
-			targetIngress, err := c.ingressesLister.Ingresses(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.BlueGreen.Ingress)
+			targetIngress, err := c.ingressWrapper.Get(ctx, c.rollout.Namespace, c.rollout.Spec.Strategy.BlueGreen.Ingress, metav1.GetOptions{})
 			if err != nil {
 				c.log.Warningf("28752921 cannot get target ingress: %s", err.Error())
 				return
 			}
-			ctx := context.TODO()
-			_, err = c.kubeclientset.NetworkingV1beta1().Ingresses(targetIngress.Namespace).Patch(
-				ctx, targetIngress.Name, patchtypes.StrategicMergePatchType, []byte(disabledMirrorPatch), metav1.PatchOptions{})
+			_, err = c.kubeclientset.NetworkingV1beta1().Ingresses(targetIngress.GetNamespace()).Patch(
+				ctx, targetIngress.GetName(), patchtypes.StrategicMergePatchType, []byte(disabledMirrorPatch), metav1.PatchOptions{})
 			if err != nil {
 				c.log.Warningf("5892359 mirror disabled error: %s", err.Error())
 				return
